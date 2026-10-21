@@ -1,0 +1,11 @@
+[Unit]
+Description=ECS Proxmox – Nachtlauf (Updates nach den nächtlichen Sicherungen der Apps)
+
+[Timer]
+# Nach den Sicherungen der Apps (02:30 bis 03:40). Andere Uhrzeit: systemctl edit ecspve-nacht.timer
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=15min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

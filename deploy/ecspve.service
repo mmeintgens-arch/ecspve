@@ -1,0 +1,20 @@
+[Unit]
+Description=ECS Proxmox – Übersicht der Container und Dienste
+Documentation=https://github.com/mmeintgens-arch/ecspve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ecspve
+Group=ecspve
+WorkingDirectory=/opt/ecspve
+ExecStart=/usr/bin/python3 /opt/ecspve/ecspve.py serve
+Restart=on-failure
+RestartSec=3
+# Schutzmaßnahmen, die auch in unprivilegierten LXC-Containern funktionieren
+NoNewPrivileges=true
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

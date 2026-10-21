@@ -1,0 +1,805 @@
+#!/usr/bin/env python3
+"""ecspve-helfer – die erlaubten Befehle der Übersicht auf dem Proxmox-Host.
+
+Läuft als root auf dem Proxmox-Host. Der Container der Übersicht ruft ihn per SSH auf; dessen Schlüssel ist in
+/root/.ssh/authorized_keys mit command="…",restrict auf dieses Programm festgelegt. Erlaubt ist nur, was hier
+steht: Container-IDs und Dienstnamen werden geprüft, freie Befehle gibt es nicht.
+
+  ecspve-helfer uebersicht                     Host, Gäste und letzte Aufträge (JSON)
+  ecspve-helfer pruefen                        Dienste, Funktionsprüfung und Updates aller laufenden Container
+  ecspve-helfer start|herunterfahren|neustart|stopp ID
+  ecspve-helfer update ID alles|system|app [--snapshots=N] [--neustart]
+  ecspve-helfer dienst ID NAME.service         einen Dienst im Container neu starten
+  ecspve-helfer host-update                    Proxmox-Host aktualisieren (apt-get dist-upgrade)
+  ecspve-helfer auffrischen                    Paketlisten in allen laufenden Containern neu laden
+  ecspve-helfer auftrag AUFTRAG                Stand und Protokoll eines Auftrags (JSON)
+  ecspve-helfer version
+
+Aufträge laufen als eigene systemd-Einheit (ecspve-<Auftrag>) weiter, auch wenn die SSH-Verbindung abreißt.
+Protokolle: /var/lib/ecspve-helfer/auftraege. Einstellungen (optional): /etc/ecspve/helfer.conf
+"""
+
+import fcntl
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VERSION = 1
+SELBST = Path(__file__).resolve()
+# Die Umgebungsvariablen gibt es nur für die Tests (test/), im Betrieb gelten die Standardpfade.
+PVE = Path(os.environ.get("ECSPVE_PVE_DIR", "/etc/pve"))
+STAND = Path(os.environ.get("ECSPVE_HELFER_DIR", "/var/lib/ecspve-helfer"))
+CACHE = Path(os.environ.get("ECSPVE_HELFER_CACHE", "/run/ecspve-helfer"))
+KONF = Path(os.environ.get("ECSPVE_HELFER_KONF", "/etc/ecspve/helfer.conf"))
+BOOT = Path(os.environ.get("ECSPVE_BOOT_DIR", "/boot"))
+KNOTEN = os.environ.get("ECSPVE_KNOTEN") or socket.gethostname().split(".")[0]
+WURZEL = os.environ.get("ECSPVE_WURZEL", "")  # Tests: Werkzeuge der Apps liegen unter diesem Ordner
+AUFTRAEGE = STAND / "auftraege"
+SPERREN = STAND / "sperren"
+PFAD = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+AUFTRAG_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,120}\.service$")
+STROM = {"start": "Starten", "herunterfahren": "Herunterfahren", "neustart": "Neustart", "stopp": "Ausschalten"}
+UPDATE_WAS = {"alles": "System und App", "system": "Betriebssystem", "app": "App"}
+
+APT_UPGRADE = (
+    "apt-get update -q && apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
+    "full-upgrade && apt-get -y -q autoremove && apt-get -q clean"
+)
+APT_ENV = ["DEBIAN_FRONTEND=noninteractive", "APT_LISTCHANGES_FRONTEND=none", "NEEDRESTART_MODE=a"]
+
+# Die eigenen Apps: erkannt an ihrer systemd-Einheit im Container. "pruefung" ist eine Adresse im Container,
+# "pruefbefehl" ein Befehl im Container. "update" läuft auf dem Host – so, wie es die jeweilige Doku beschreibt.
+# {id} = Container-ID, {STREETWORKDOC_QUELLE} = Projektordner aus helfer.conf.
+APPS = [
+    {"key": "ecswebsite", "name": "Website", "merkmal": "ecswebsite-web.service",
+     "pruefung": "http://127.0.0.1:8000/healthz",
+     "update": ["/opt/ecswebsite/pve-install.sh", "--pull", "--update", "--ctid={id}"]},
+    {"key": "ecswiki", "name": "Wiki", "merkmal": "ecswiki.service",
+     "pruefung": "http://127.0.0.1:3100/healthz",
+     "update": ["/opt/ecswiki/pve-install.sh", "--pull", "--update", "--ctid={id}"]},
+    {"key": "turnierapp", "name": "Turniersystem", "merkmal": "turnierapp.service",
+     "pruefung": "http://127.0.0.1:3000/healthz",
+     "update": ["/usr/local/sbin/turnierapp-update-lxc", "{id}", "--pull"],
+     "ersatz": ["pct", "exec", "{id}", "--", "turnierapp-update"]},
+    {"key": "ecsapp", "name": "Recherchetool", "merkmal": "eventcrew-web.service",
+     "pruefbefehl": "python3 /opt/eventcrew-app/deploy/lxc/probe.py",
+     "update": ["pct", "exec", "{id}", "--", "bash", "/opt/eventcrew-app/deploy/lxc/update.sh"]},
+    {"key": "streetworkdoc", "name": "StreetworkDoc", "merkmal": "streetworkdoc.service",
+     "pruefung": "https://127.0.0.1:8443/api/v1/info",
+     "git": "{STREETWORKDOC_QUELLE}",
+     "update": ["{STREETWORKDOC_QUELLE}/deploy/proxmox/create-lxc.sh", "--update", "{id}"]},
+    {"key": "ecspve", "name": "Übersicht", "merkmal": "ecspve.service",
+     "pruefbefehl": "ecspve ping",
+     "update": ["/opt/ecspve/pve-install.sh", "--pull", "--update", "--ctid={id}"]},
+]
+APPS_NACH_KEY = {a["key"]: a for a in APPS}
+
+# Läuft im Container (sh). Gibt Zeilen „schlüssel=wert“ aus; „u:“-Zeilen kommen von systemctl show.
+PROBE = r"""
+export LC_ALL=C
+echo "os=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME")"
+echo "ip=$(hostname -I 2>/dev/null)"
+einheiten="nginx.service caddy.service"
+for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer; do
+  [ -f "$f" ] && [ ! -L "$f" ] || continue
+  case "${f##*/}" in *@.*) continue ;; esac
+  einheiten="$einheiten ${f##*/}"
+done
+systemctl show --property=Id,LoadState,ActiveState,SubState,Type,UnitFileState $einheiten 2>/dev/null | sed 's/^/u:/'
+systemctl list-units --failed --no-legend --plain 2>/dev/null | awk '{print "failed=" $1}'
+[ -e /run/reboot-required ] && echo "neustart=1"
+# Updates zählen kostet Zeit – nur neu, wenn sich Paketlisten oder installierte Pakete geändert haben
+marke=$(stat -c %Y /var/lib/apt/lists /var/lib/dpkg/status 2>/dev/null | tr '\n' ' ')
+if [ -f /run/ecspve-updates ] && [ "$(head -n 1 /run/ecspve-updates)" = "$marke" ]; then
+  echo "updates=$(tail -n 1 /run/ecspve-updates)"
+else
+  n=$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null | grep -c '^Inst ')
+  printf '%s\n%s\n' "$marke" "$n" >/run/ecspve-updates 2>/dev/null
+  echo "updates=$n"
+fi
+ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
+pruefe_url() {
+  t0=$(date +%s%N)
+  if command -v curl >/dev/null 2>&1; then
+    code=$(curl -ks -o /dev/null -m 8 -w '%{http_code}' "$2" 2>/dev/null)
+  elif command -v python3 >/dev/null 2>&1; then
+    code=$(python3 -c 'import ssl,sys,urllib.request,urllib.error
+c = ssl.create_default_context(); c.check_hostname = False; c.verify_mode = ssl.CERT_NONE
+try: print(urllib.request.urlopen(sys.argv[1], timeout=8, context=c).status)
+except urllib.error.HTTPError as e: print(e.code)
+except Exception: print("000")' "$2" 2>/dev/null)
+  else
+    code="?"
+  fi
+  case "$code" in 2??|3??) ok=1 ;; *) ok=0 ;; esac
+  echo "pruefung=$1|$ok|$(ms "$t0")|HTTP ${code:-000} $2"
+}
+pruefe_befehl() {
+  t0=$(date +%s%N)
+  aus=$(sh -c "$2" 2>&1) && ok=1 || ok=0
+  echo "pruefung=$1|$ok|$(ms "$t0")|$(printf '%s' "$aus" | tail -n 1 | cut -c1-120)"
+}
+"""
+
+
+class Fehler(Exception):
+    pass
+
+
+# --- Hilfen ------------------------------------------------------------------------------------------
+
+def ausgabe(daten, code=0):
+    print(json.dumps(daten, ensure_ascii=False))
+    sys.exit(code)
+
+
+def ausfuehren(args, timeout=60):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "Zeitüberschreitung"
+    except FileNotFoundError:
+        return 127, "", f"{args[0]} nicht gefunden"
+
+
+def lade_konf():
+    werte = {"STREETWORKDOC_QUELLE": "/root/StreetworkDoc", "HOST_UPDATE": "ja"}
+    try:
+        zeilen = KONF.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return werte
+    for zeile in zeilen:
+        zeile = zeile.strip()
+        if not zeile or zeile.startswith("#") or "=" not in zeile:
+            continue
+        k, v = zeile.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        werte[k.strip()] = v
+    return werte
+
+
+def ja(wert):
+    return str(wert).strip().lower() in ("ja", "1", "true", "yes", "an", "on")
+
+
+def pvesh(pfad):
+    rc, out, err = ausfuehren(["pvesh", "get", pfad, "--output-format", "json"], timeout=60)
+    if rc != 0:
+        raise Fehler(f"pvesh {pfad}: {(err.strip().splitlines() or [rc])[-1]}")
+    return json.loads(out or "null")
+
+
+def gast_conf(knoten, typ, gid):
+    """Einstellungen eines Gasts direkt aus /etc/pve (schneller als pct config): onboot und Snapshots."""
+    ordner = "lxc" if typ == "lxc" else "qemu-server"
+    erg = {"onboot": False, "snapshots": [], "da": False}
+    try:
+        text = (PVE / "nodes" / knoten / ordner / f"{gid}.conf").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return erg
+    erg["da"] = True
+    haupt = True
+    for zeile in text.splitlines():
+        m = re.match(r"^\[([^\]]+)\]\s*$", zeile)
+        if m:
+            haupt = False
+            if m.group(1) != "pve:pending":
+                erg["snapshots"].append(m.group(1))
+        elif haupt and re.match(r"^onboot:\s*1\s*$", zeile):
+            erg["onboot"] = True
+    return erg
+
+
+def lokaler_typ(gid):
+    for typ in ("lxc", "qemu"):
+        if gast_conf(KNOTEN, typ, gid)["da"]:
+            return typ
+    return None
+
+
+def gast_status(gid, typ):
+    rc, out, _ = ausfuehren(["pct" if typ == "lxc" else "qm", "status", str(gid)], timeout=30)
+    return out.split(":", 1)[-1].strip() if rc == 0 else "unbekannt"
+
+
+def zwischenspeicher(name, sekunden, holen):
+    pfad = CACHE / f"{name}.json"
+    try:
+        if time.time() - pfad.stat().st_mtime < sekunden:
+            return json.loads(pfad.read_text())
+    except (OSError, ValueError):
+        pass
+    daten = holen()
+    try:
+        CACHE.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = pfad.with_suffix(".tmp")
+        tmp.write_text(json.dumps(daten))
+        tmp.replace(pfad)
+    except OSError:
+        pass
+    return daten
+
+
+def versions_schluessel(text):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", text)]
+
+
+def gueltige_id(text):
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", text or ""):
+        raise Fehler(f"Ungültige ID: {text}")
+    return int(text)
+
+
+# --- Übersicht ---------------------------------------------------------------------------------------
+
+def host_details():
+    erg = {"pve": "", "kernel": os.environ.get("ECSPVE_KERNEL") or os.uname().release, "kernel_neustart": False,
+           "updates": None, "update_liste": []}
+    rc, out, _ = ausfuehren(["pveversion"], timeout=30)
+    m = re.search(r"pve-manager/([0-9][^/\s]*)", out)
+    if m:
+        erg["pve"] = m.group(1)
+    kerne = [p.name[len("vmlinuz-"):] for p in BOOT.glob("vmlinuz-*")]
+    if kerne:
+        erg["kernel_neustart"] = max(kerne, key=versions_schluessel) != erg["kernel"]
+    try:
+        pakete = pvesh(f"/nodes/{KNOTEN}/apt/update") or []
+        erg["updates"] = len(pakete)
+        erg["update_liste"] = [f'{p.get("Package")} {p.get("OldVersion", "")} → {p.get("Version", "")}'
+                               for p in pakete[:60]]
+    except (Fehler, ValueError):
+        pass
+    return erg
+
+
+def fehlgeschlagene_einheiten():
+    rc, out, _ = ausfuehren(["systemctl", "list-units", "--failed", "--no-legend", "--plain"], timeout=30)
+    return [z.split()[0] for z in out.splitlines() if z.strip()] if rc == 0 else []
+
+
+def uebersicht():
+    gaeste, host = [], {"name": KNOTEN}
+    for r in pvesh("/cluster/resources"):
+        typ = r.get("type")
+        if typ == "node" and r.get("node") == KNOTEN:
+            host.update({k: r.get(k) for k in ("status", "cpu", "maxcpu", "mem", "maxmem", "disk", "maxdisk", "uptime")})
+        elif typ in ("lxc", "qemu"):
+            gid = int(r["vmid"])
+            conf = gast_conf(r.get("node", ""), typ, gid)
+            gaeste.append({
+                "id": gid, "typ": typ, "name": r.get("name") or f"{typ}-{gid}", "status": r.get("status", "unknown"),
+                "knoten": r.get("node"), "lokal": r.get("node") == KNOTEN, "vorlage": bool(r.get("template")),
+                "cpu": r.get("cpu") or 0, "maxcpu": r.get("maxcpu") or 0, "mem": r.get("mem") or 0,
+                "maxmem": r.get("maxmem") or 0, "disk": r.get("disk") or 0, "maxdisk": r.get("maxdisk") or 0,
+                "uptime": r.get("uptime") or 0, "tags": [t for t in re.split(r"[;, ]+", r.get("tags") or "") if t],
+                "onboot": conf["onboot"], "snapshots": [s for s in conf["snapshots"] if s.startswith("ecspve_")],
+            })
+    gaeste.sort(key=lambda g: g["id"])
+    host.update(zwischenspeicher("host", 600, host_details))
+    host["dienste_fehler"] = fehlgeschlagene_einheiten()
+    return {"version": VERSION, "knoten": KNOTEN, "zeit": time.time(), "host": host, "gaeste": gaeste,
+            "auftraege": auftraege_liste(30)}
+
+
+# --- Prüfung der Container ---------------------------------------------------------------------------
+
+def probe_skript(gid, konf):
+    zeilen = [PROBE]
+    eigen = konf.get(f"PRUEFUNG_{gid}", "").strip()
+    for app in APPS:
+        aufruf = ""
+        if not eigen:
+            if app.get("pruefung"):
+                aufruf = f"pruefe_url {app['key']} {shlex.quote(app['pruefung'])}"
+            elif app.get("pruefbefehl"):
+                aufruf = f"pruefe_befehl {app['key']} {shlex.quote(app['pruefbefehl'])}"
+        zeilen.append(f'if [ -f /etc/systemd/system/{app["merkmal"]} ]; then echo "app={app["key"]}"; {aufruf or ":"}; fi')
+    if eigen:
+        art = "pruefe_url" if re.match(r"^https?://", eigen) else "pruefe_befehl"
+        zeilen.append(f"{art} eigen {shlex.quote(eigen)}")
+    zeilen.append("exit 0")
+    return "\n".join(zeilen)
+
+
+def bewerte_einheit(p):
+    if p.get("LoadState") in (None, "", "not-found"):
+        return None
+    name, aktiv, sub = p.get("Id", "?"), p.get("ActiveState", ""), p.get("SubState", "")
+    an = p.get("UnitFileState", "") in ("enabled", "enabled-runtime")
+    if aktiv == "failed":
+        zustand = "fehler"
+    elif aktiv in ("active", "reloading", "activating", "deactivating"):
+        zustand = "ok"
+    elif not an or (name.endswith(".service") and p.get("Type") == "oneshot"):
+        zustand = "ruhe"  # läuft nur per Zeitplan oder bei Bedarf
+    else:
+        zustand = "fehler"  # eingeschaltet, läuft aber nicht
+    return {"name": name, "zustand": zustand, "text": f"{aktiv} ({sub})" if sub else aktiv}
+
+
+def werte_probe_aus(text):
+    erg = {"os": "", "ip": "", "neustart": False, "updates": None, "apps": [], "dienste": [], "pruefungen": []}
+    bloecke, block, failed = [], {}, []
+    for zeile in text.splitlines():
+        if zeile.startswith("u:"):
+            k, gleich, v = zeile[2:].partition("=")
+            if not gleich:
+                if block:
+                    bloecke.append(block)
+                block = {}
+            else:
+                block[k] = v
+            continue
+        k, _, v = zeile.partition("=")
+        if k in ("os", "ip"):
+            erg[k] = v.strip()
+        elif k == "neustart":
+            erg["neustart"] = True
+        elif k == "updates" and v.strip().isdigit():
+            erg["updates"] = int(v)
+        elif k == "app" and v not in erg["apps"]:
+            erg["apps"].append(v.strip())
+        elif k == "failed" and v:
+            failed.append(v.strip())
+        elif k == "pruefung":
+            teile = v.split("|", 3)
+            if len(teile) == 4:
+                detail = teile[3].strip()
+                if detail.startswith("HTTP 000"):
+                    detail = "keine Antwort" + detail[8:]
+                erg["pruefungen"].append({"app": teile[0], "ok": teile[1] == "1",
+                                          "ms": int(teile[2]) if teile[2].isdigit() else None, "detail": detail})
+    if block:
+        bloecke.append(block)
+    namen = set()
+    for b in bloecke:
+        d = bewerte_einheit(b)
+        if d and d["name"] not in namen:
+            namen.add(d["name"])
+            erg["dienste"].append(d)
+    for name in failed:
+        if name not in namen:
+            erg["dienste"].append({"name": name, "zustand": "fehler", "text": "failed"})
+    rang = {"fehler": 0, "ok": 1, "ruhe": 2}
+    erg["dienste"].sort(key=lambda d: (rang.get(d["zustand"], 3), d["name"].endswith(".timer"), d["name"]))
+    erg["ip"] = erg["ip"].split()[0] if erg["ip"] else ""
+    return erg
+
+
+def probe(gid, konf=None):
+    konf = konf or lade_konf()
+    rc, out, err = ausfuehren(["pct", "exec", str(gid), "--", "sh", "-c", probe_skript(gid, konf)], timeout=45)
+    erg = werte_probe_aus(out)
+    erg["zeit"] = time.time()
+    if rc != 0 and not out.strip():
+        erg["fehler"] = ((err.strip().splitlines() or [f"pct exec endete mit Code {rc}"])[-1])[:200]
+    erg["app_name"] = next((APPS_NACH_KEY[a]["name"] for a in erg["apps"] if a in APPS_NACH_KEY), "")
+    erg["app_update"] = app_update_befehle(gid, erg["apps"], konf) is not None
+    return erg
+
+
+def pruefen_alle():
+    konf = lade_konf()
+    ids = []
+    for r in pvesh("/cluster/resources"):
+        if r.get("type") == "lxc" and r.get("node") == KNOTEN and r.get("status") == "running" and not r.get("template"):
+            ids.append(int(r["vmid"]))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        ergebnisse = list(pool.map(lambda gid: probe(gid, konf), ids))
+    return {str(gid): erg for gid, erg in zip(ids, ergebnisse)}
+
+
+def app_update_befehle(gid, apps, konf):
+    """Befehle (auf dem Host) für das App-Update eines Containers – None, wenn keins eingerichtet ist."""
+    eigen = konf.get(f"UPDATE_{gid}", "").strip()
+    if eigen:
+        return [["bash", "-c", eigen.replace("{id}", str(gid))]]
+    quelle = konf.get("STREETWORKDOC_QUELLE", "/root/StreetworkDoc")
+    for key in apps:
+        app = APPS_NACH_KEY.get(key)
+        if not app:
+            continue
+
+        def ersetze(teil):
+            return teil.replace("{id}", str(gid)).replace("{STREETWORKDOC_QUELLE}", quelle)
+
+        befehl = [ersetze(t) for t in app["update"]]
+        if befehl[0].startswith("/"):
+            befehl[0] = WURZEL + befehl[0]
+        if befehl[0].startswith("/") and not Path(befehl[0]).exists():
+            if not app.get("ersatz"):
+                continue
+            befehl = [ersetze(t) for t in app["ersatz"]]
+        schritte = [["git", "-C", ersetze(app["git"]), "pull", "--ff-only"]] if app.get("git") else []
+        return schritte + [befehl]
+    return None
+
+
+# --- Aufträge ----------------------------------------------------------------------------------------
+
+def auftrag_pfad(jid, endung):
+    return AUFTRAEGE / f"{jid}.{endung}"
+
+
+def schreibe(job):
+    AUFTRAEGE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = auftrag_pfad(job["id"], "tmp")
+    tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(auftrag_pfad(job["id"], "json"))
+
+
+def lies(jid):
+    if not AUFTRAG_RE.match(jid or ""):
+        raise Fehler("Ungültiger Auftrag.")
+    try:
+        job = json.loads(auftrag_pfad(jid, "json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise Fehler(f"Auftrag {jid} gibt es nicht.")
+    if job.get("status") in ("wartet", "laeuft") and job.get("pid") and not Path(f"/proc/{job['pid']}").exists():
+        job["status"], job["ergebnis"] = "fehler", "abgebrochen (Prozess beendet)"
+    return job
+
+
+def auftraege_liste(anzahl):
+    try:
+        namen = sorted((p.stem for p in AUFTRAEGE.glob("*.json")), reverse=True)
+    except OSError:
+        return []
+    liste = []
+    for jid in namen[:anzahl]:
+        try:
+            liste.append(lies(jid))
+        except Fehler:
+            pass
+    return liste
+
+
+def aufraeumen(behalten=150):
+    namen = sorted((p.stem for p in AUFTRAEGE.glob("*.json")), reverse=True)
+    for jid in namen[behalten:]:
+        for endung in ("json", "log"):
+            auftrag_pfad(jid, endung).unlink(missing_ok=True)
+
+
+def beschaeftigt(gid):
+    return any(j["gast"] == gid and j["status"] in ("wartet", "laeuft") for j in auftraege_liste(30))
+
+
+def neuer_auftrag(art, titel, gast=None, **param):
+    if gast is not None and beschaeftigt(gast):
+        raise Fehler("Für diesen Gast läuft schon ein Auftrag – bitte warten, bis er fertig ist.")
+    jid = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3)
+    job = {"id": jid, "art": art, "titel": titel, "gast": gast, "param": param, "status": "wartet",
+           "start": time.time(), "ende": None, "ergebnis": "", "hinweise": [], "pid": None}
+    schreibe(job)
+    aufraeumen()
+    umgebung = {"HOME": "/root", "LC_ALL": "C.UTF-8", "PATH": f"{os.environ.get('PATH', '')}:{PFAD}".strip(":")}
+    if shutil.which("systemd-run") and not os.environ.get("ECSPVE_OHNE_SYSTEMD"):
+        rc, _, err = ausfuehren(["systemd-run", f"--unit=ecspve-{jid}", "--collect", "--quiet",
+                                 *[f"--setenv={k}={v}" for k, v in umgebung.items()],
+                                 sys.executable, str(SELBST), "_lauf", jid], timeout=30)
+        if rc != 0:
+            job.update(status="fehler", ende=time.time(), ergebnis=f"Start fehlgeschlagen: {err.strip()[:200]}")
+            schreibe(job)
+    else:
+        subprocess.Popen([sys.executable, str(SELBST), "_lauf", jid], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env={**os.environ, **umgebung})
+    return job
+
+
+class Sperre:
+    """flock auf eine Datei – hält, bis der Prozess endet oder frei() aufgerufen wird."""
+
+    def __init__(self, name):
+        SPERREN.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.fd = os.open(SPERREN / f"{name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+
+    def nehmen(self, warten=True):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | (0 if warten else fcntl.LOCK_NB))
+            return True
+        except BlockingIOError:
+            return False
+
+    def frei(self):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+class Protokoll:
+    def __init__(self, jid):
+        self.datei = open(auftrag_pfad(jid, "log"), "a", encoding="utf-8")
+
+    def zeile(self, text):
+        self.datei.write(f"[{time.strftime('%H:%M:%S')}] {text}\n")
+        self.datei.flush()
+
+    def abschnitt(self, text):
+        self.zeile(f"=== {text}")
+
+    def befehl(self, args, timeout=3600, umgebung=None):
+        self.zeile("$ " + shlex.join(str(a) for a in args))
+        try:
+            p = subprocess.Popen([str(a) for a in args], stdout=self.datei, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, cwd="/root" if Path("/root").is_dir() else "/",
+                                 env={**os.environ, **(umgebung or {})})
+        except OSError as e:
+            self.zeile(f"Fehler: {e}")
+            return 127
+        try:
+            rc = p.wait(timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            self.zeile(f"Abgebrochen: länger als {timeout // 60} Minuten")
+            return 124
+        if rc:
+            self.zeile(f"Endete mit Code {rc}")
+        return rc
+
+
+def lauf(jid):
+    job = lies(jid)
+    job.update(pid=os.getpid())
+    schreibe(job)
+    log = Protokoll(jid)
+    gid = job["gast"]
+    sperren = []
+    try:
+        if job["art"] in ("update", "host-update"):
+            # Updates nacheinander, nie mehrere gleichzeitig (Last, Paketquellen, Snapshots)
+            sperren.append(Sperre("updates"))
+            if not sperren[-1].nehmen(warten=False):
+                log.zeile("Warte, bis das vorige Update fertig ist …")
+                sperren[-1].nehmen()
+        sperren.append(Sperre(f"gast-{gid}" if gid is not None else job["art"]))
+        if not sperren[-1].nehmen(warten=False):
+            raise Fehler("Für diesen Gast läuft schon ein Auftrag.")
+        job.update(status="laeuft", start=time.time())
+        schreibe(job)
+        log.abschnitt(job["titel"])
+        status, text = AUSFUEHRUNG[job["art"]](job, log)
+    except Fehler as e:
+        status, text = "fehler", str(e)
+    except Exception as e:  # noqa: BLE001 – jeder Fehler soll im Auftrag stehen
+        status, text = "fehler", f"Interner Fehler: {e!r}"
+    finally:
+        for s in reversed(sperren):
+            s.frei()
+    log.abschnitt(f"Ergebnis: {text}")
+    job = lies(jid)
+    job.update(status=status, ergebnis=text, ende=time.time())
+    schreibe(job)
+
+
+def a_strom(job, log):
+    gid, art = job["gast"], job["param"]["aktion"]
+    typ = lokaler_typ(gid)
+    if not typ:
+        raise Fehler(f"Gast {gid} gibt es auf diesem Knoten nicht.")
+    werkzeug = "pct" if typ == "lxc" else "qm"
+    befehl = {"start": ["start"], "herunterfahren": ["shutdown", "--timeout", "120"],
+              "neustart": ["reboot"], "stopp": ["stop"]}[art]
+    rc = log.befehl([werkzeug, befehl[0], gid, *befehl[1:]], timeout=600)
+    return ("ok", "Erledigt") if rc == 0 else ("fehler", f"{werkzeug} {befehl[0]} endete mit Code {rc}")
+
+
+def snapshot(gid, behalten, log):
+    name = "ecspve_" + time.strftime("%Y%m%d_%H%M%S")
+    log.abschnitt(f"Snapshot {name}")
+    if log.befehl(["pct", "snapshot", gid, name, "--description", "Vor Update (ecspve)"], timeout=1800):
+        return "Snapshot nicht möglich (Speicher ohne Snapshots oder Bind-Mount?) – Update lief ohne Snapshot."
+    alte = sorted(s for s in gast_conf(KNOTEN, "lxc", gid)["snapshots"] if s.startswith("ecspve_"))
+    for alt in alte[:-max(behalten, 1)]:
+        log.befehl(["pct", "delsnapshot", gid, alt], timeout=1800)
+    return None
+
+
+def stoerungen(erg):
+    teile = [f"Dienst {d['name']}" for d in erg.get("dienste", []) if d["zustand"] == "fehler"]
+    teile += [f"Prüfung {p['app']} ({p['detail']})" for p in erg.get("pruefungen", []) if not p["ok"]]
+    if erg.get("fehler"):
+        teile.append(erg["fehler"])
+    return teile
+
+
+def a_update(job, log):
+    gid, p = job["gast"], job["param"]
+    was = p["was"]
+    if lokaler_typ(gid) != "lxc":
+        raise Fehler("Updates gibt es nur für Container (LXC) auf diesem Knoten.")
+    if gast_status(gid, "lxc") != "running":
+        raise Fehler("Der Container läuft nicht – bitte erst starten.")
+    konf = lade_konf()
+    vorher = probe(gid, konf)
+    warnungen, hinweise = [], []
+    if p.get("snapshots", 0) > 0:
+        w = snapshot(gid, p["snapshots"], log)
+        if w:
+            warnungen.append(w)
+    if was in ("alles", "system"):
+        log.abschnitt("Betriebssystem im Container aktualisieren")
+        if log.befehl(["pct", "exec", gid, "--", "env", *APT_ENV, "sh", "-c", APT_UPGRADE]):
+            raise Fehler("Update des Betriebssystems fehlgeschlagen – Details im Protokoll.")
+    if was in ("alles", "app"):
+        befehle = app_update_befehle(gid, vorher["apps"], konf)
+        if befehle is None:
+            if was == "app":
+                raise Fehler("Für diesen Container ist kein App-Update eingerichtet.")
+            log.zeile("Kein App-Update eingerichtet – übersprungen.")
+        else:
+            log.abschnitt(f"App aktualisieren ({vorher['app_name'] or 'eigener Befehl'})")
+            for befehl in befehle:
+                if log.befehl(befehl, umgebung={"HOME": "/root"}):
+                    raise Fehler("App-Update fehlgeschlagen – Details im Protokoll.")
+    time.sleep(5)
+    nachher = probe(gid, konf)
+    if nachher["neustart"] and p.get("neustart"):
+        log.abschnitt("Container neu starten (vom Update verlangt)")
+        log.befehl(["pct", "reboot", gid], timeout=600)
+        time.sleep(15)
+        nachher = probe(gid, konf)
+    elif nachher["neustart"]:
+        hinweise.append("Neustart empfohlen")
+    probleme = stoerungen(nachher)
+    if probleme:
+        log.zeile("Nach dem Update gestört – neue Prüfung in 30 Sekunden …")
+        time.sleep(30)
+        probleme = stoerungen(probe(gid, konf))
+    job_hinweise(job, hinweise)
+    if probleme:
+        return "warnung", "Aktualisiert, aber gestört: " + ", ".join(probleme)
+    if warnungen:
+        return "warnung", "Aktualisiert. " + " ".join(warnungen)
+    return "ok", "Aktualisiert" + (f" – {', '.join(hinweise)}" if hinweise else "")
+
+
+def job_hinweise(job, hinweise):
+    if hinweise:
+        aktuell = lies(job["id"])
+        aktuell["hinweise"] = hinweise
+        schreibe(aktuell)
+
+
+def a_dienst(job, log):
+    gid, dienst = job["gast"], job["param"]["dienst"]
+    rc = log.befehl(["pct", "exec", gid, "--", "systemctl", "restart", dienst], timeout=300)
+    log.befehl(["pct", "exec", gid, "--", "systemctl", "--no-pager", "--lines=20", "status", dienst], timeout=60)
+    return ("ok", f"{dienst} neu gestartet") if rc == 0 else ("fehler", f"{dienst} startet nicht (Code {rc})")
+
+
+def a_host_update(job, log):
+    env = {k: v for k, v in (e.split("=", 1) for e in APT_ENV)}
+    if log.befehl(["apt-get", "update"], timeout=900, umgebung=env):
+        raise Fehler("apt-get update fehlgeschlagen (Paketquellen prüfen).")
+    if log.befehl(["apt-get", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold",
+                   "dist-upgrade"], umgebung=env):
+        raise Fehler("Update des Hosts fehlgeschlagen – Details im Protokoll.")
+    (CACHE / "host.json").unlink(missing_ok=True)
+    details = host_details()
+    if details["kernel_neustart"]:
+        job_hinweise(job, ["Neuer Kernel – Host bei Gelegenheit neu starten"])
+        return "ok", "Aktualisiert – neuer Kernel: Host bei Gelegenheit neu starten"
+    return "ok", "Aktualisiert"
+
+
+def a_auffrischen(job, log):
+    fehler = []
+    for r in pvesh("/cluster/resources"):
+        if r.get("type") == "lxc" and r.get("node") == KNOTEN and r.get("status") == "running" and not r.get("template"):
+            if log.befehl(["pct", "exec", int(r["vmid"]), "--", "apt-get", "update", "-qq"], timeout=600):
+                fehler.append(str(r["vmid"]))
+    return ("warnung", f"Nicht möglich in: {', '.join(fehler)}") if fehler else ("ok", "Paketlisten aktuell")
+
+
+AUSFUEHRUNG = {"strom": a_strom, "update": a_update, "dienst": a_dienst,
+               "host-update": a_host_update, "auffrischen": a_auffrischen}
+
+
+# --- Befehle -----------------------------------------------------------------------------------------
+
+def lokaler_gast(text):
+    gid = gueltige_id(text)
+    typ = lokaler_typ(gid)
+    if not typ:
+        raise Fehler(f"Gast {gid} gibt es auf diesem Knoten nicht.")
+    return gid, typ
+
+
+def befehl(argv, intern):
+    if not argv:
+        raise Fehler("Befehl fehlt (Hilfe: ecspve-helfer --help).")
+    name, args = argv[0], argv[1:]
+    if name == "version":
+        return {"version": VERSION, "knoten": KNOTEN}
+    if name == "uebersicht":
+        return uebersicht()
+    if name == "pruefen":
+        return {"zeit": time.time(), "gaeste": pruefen_alle()}
+    if name in STROM and len(args) == 1:
+        gid, typ = lokaler_gast(args[0])
+        return neuer_auftrag("strom", f"{STROM[name]}: {gid}", gid, aktion=name)
+    if name == "update" and len(args) >= 2 and args[1] in UPDATE_WAS:
+        gid, typ = lokaler_gast(args[0])
+        if typ != "lxc":
+            raise Fehler("Updates gibt es nur für Container (LXC).")
+        param = {"was": args[1], "snapshots": 0, "neustart": False}
+        for opt in args[2:]:
+            if re.fullmatch(r"--snapshots=[0-9]", opt):
+                param["snapshots"] = int(opt.split("=")[1])
+            elif opt == "--neustart":
+                param["neustart"] = True
+            else:
+                raise Fehler(f"Unbekannte Option: {opt}")
+        return neuer_auftrag("update", f"Update {UPDATE_WAS[args[1]]}: {gid}", gid, **param)
+    if name == "dienst" and len(args) == 2:
+        gid, typ = lokaler_gast(args[0])
+        if typ != "lxc" or not DIENST_RE.match(args[1]):
+            raise Fehler("Ungültiger Dienst.")
+        return neuer_auftrag("dienst", f"Dienst neu starten: {gid} {args[1]}", gid, dienst=args[1])
+    if name == "host-update" and not args:
+        if not ja(lade_konf().get("HOST_UPDATE", "ja")):
+            raise Fehler("Host-Updates über die Übersicht sind abgeschaltet (HOST_UPDATE in /etc/ecspve/helfer.conf).")
+        return neuer_auftrag("host-update", f"Update Proxmox-Host {KNOTEN}")
+    if name == "auffrischen" and not args:
+        return neuer_auftrag("auffrischen", "Paketlisten in den Containern neu laden")
+    if name == "auftrag" and len(args) == 1:
+        job = lies(args[0])
+        try:
+            with open(auftrag_pfad(job["id"], "log"), "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 65536))
+                job["protokoll"] = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            job["protokoll"] = ""
+        return job
+    if name == "_lauf" and intern and len(args) == 1:
+        lauf(args[0])
+        return None
+    raise Fehler(f"Unbekannter oder unvollständiger Befehl: {' '.join(argv)[:80]}")
+
+
+def main():
+    if len(sys.argv) > 1:
+        # Von Hand (root auf dem Host) oder als Auftrag über systemd-run
+        argv, intern = sys.argv[1:], True
+        if argv[0] in ("-h", "--help"):
+            print(__doc__)
+            return
+    else:
+        # Über den festgelegten SSH-Schlüssel (command="…" ohne Argumente): nur der übermittelte Befehl zählt,
+        # interne Befehle (_…) nie.
+        try:
+            argv = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        except ValueError:
+            ausgabe({"fehler": "Ungültiger Befehl."}, 2)
+        intern = False
+        if argv and argv[0].startswith("_"):
+            ausgabe({"fehler": "Nicht erlaubt."}, 2)
+    if os.geteuid() != 0 and not os.environ.get("ECSPVE_TEST"):
+        ausgabe({"fehler": "ecspve-helfer muss als root auf dem Proxmox-Host laufen."}, 2)
+    try:
+        erg = befehl(argv, intern)
+    except Fehler as e:
+        ausgabe({"fehler": str(e)}, 1)
+    if erg is not None:
+        ausgabe(erg)
+
+
+if __name__ == "__main__":
+    main()

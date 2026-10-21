@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>ECS Proxmox</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="kopf">
+  <div class="marke">
+    <img src="/favicon.svg" alt="" width="32" height="32">
+    <div>
+      <h1>ECS Proxmox</h1>
+      <p id="untertitel">Übersicht der Container und Dienste</p>
+    </div>
+  </div>
+  <div class="kopf-rechts">
+    <span id="gesamt" class="pille" hidden></span>
+    <button id="abmelden" class="leise" type="button" hidden>Abmelden</button>
+  </div>
+</header>
+
+<main id="inhalt" hidden>
+  <section id="meldungen" aria-live="polite"></section>
+  <section id="host" class="karte host"></section>
+  <section>
+    <div class="abschnitt-kopf">
+      <h2>Container und VMs</h2>
+      <div class="werkzeuge">
+        <span id="pruefstand" class="leise-text"></span>
+        <button id="pruefen" type="button">Jetzt prüfen</button>
+        <button id="alle" type="button">Alle aktualisieren</button>
+      </div>
+    </div>
+    <div id="gaeste" class="raster"></div>
+  </section>
+  <section class="zwei">
+    <div class="karte">
+      <h2>Aufträge</h2>
+      <ul id="auftraege" class="auftraege"></ul>
+    </div>
+    <div class="karte">
+      <h2>Automatische Updates</h2>
+      <div id="nacht"></div>
+    </div>
+  </section>
+  <section class="karte">
+    <h2>Schnittstellen für Monitoring</h2>
+    <div id="schnittstellen"></div>
+  </section>
+</main>
+
+<section id="anmeldung" class="anmeldung" hidden>
+  <form id="anmeldeform" class="karte">
+    <img src="/favicon.svg" alt="" width="40" height="40">
+    <h1>ECS Proxmox</h1>
+    <p class="leise-text">Übersicht der Container und Dienste</p>
+    <label for="passwort">Passwort</label>
+    <input id="passwort" type="password" autocomplete="current-password" required>
+    <button type="submit" class="haupt">Anmelden</button>
+    <p id="anmeldefehler" class="fehlertext" role="alert"></p>
+  </form>
+</section>
+
+<dialog id="protokoll">
+  <div class="dialog-kopf">
+    <h2 id="protokoll-titel">Protokoll</h2>
+    <button id="protokoll-zu" type="button" class="leise">Schließen</button>
+  </div>
+  <p id="protokoll-status"></p>
+  <pre id="protokoll-text"></pre>
+</dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

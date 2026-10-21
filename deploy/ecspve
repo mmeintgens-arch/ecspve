@@ -1,0 +1,10 @@
+#!/bin/sh
+# Befehle der Übersicht (ecspve --help). Passwort und Token setzt root, alles andere läuft als Benutzer ecspve –
+# so nutzt es denselben SSH-Schlüssel und dieselbe Verbindung wie der Dienst.
+case "${1:-}" in
+  passwort | token) exec /usr/bin/python3 /opt/ecspve/ecspve.py "$@" ;;
+esac
+if [ "$(id -u)" -eq 0 ]; then
+  exec runuser -u ecspve -- /usr/bin/python3 /opt/ecspve/ecspve.py "$@"
+fi
+exec /usr/bin/python3 /opt/ecspve/ecspve.py "$@"

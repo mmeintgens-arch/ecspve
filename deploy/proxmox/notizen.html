@@ -1,0 +1,26 @@
+<h2>🖥️ ECS Proxmox – Übersicht der Container und Dienste</h2>
+<p>Python-Dienst <code>ecspve</code> auf Port 8080 – nur HTTP, HTTPS macht euer Caddy davor (<code>reverse_proxy &lt;IP&gt;:8080</code>). Was den Host betrifft, erledigt <code>/usr/local/sbin/ecspve-helfer</code> auf dem Proxmox-Host – der Container ruft ihn per SSH mit einem Schlüssel auf, der nur diesen Helfer starten darf.</p>
+<table>
+<tr><th align="left">Was</th><th align="left">Wo</th></tr>
+<tr><td>Programm</td><td><code>/opt/ecspve</code> (wird bei jedem Update ersetzt)</td></tr>
+<tr><td>Einstellungen</td><td><code>/etc/ecspve/ecspve.env</code> – Port, Token, Snapshots, Benachrichtigungen</td></tr>
+<tr><td>Auswahl „nachts automatisch“, letzter Nachtlauf</td><td><code>/var/lib/ecspve</code></td></tr>
+<tr><td>SSH-Schlüssel zum Helfer</td><td><code>/etc/ecspve/ssh</code></td></tr>
+<tr><td>Helfer, Aufträge und Protokolle</td><td>auf dem <b>Proxmox-Host</b>: <code>/usr/local/sbin/ecspve-helfer</code>, <code>/var/lib/ecspve-helfer/auftraege</code>, <code>/etc/ecspve/helfer.conf</code></td></tr>
+<tr><td>Projektordner</td><td>auf dem Host: <code>/opt/ecspve</code></td></tr>
+<tr><td>Passwort</td><td>auf dem Host: <code>/root/ecspve-ctCTID-passwort.txt</code></td></tr>
+</table>
+<h3>Vom Proxmox-Host (Container CTID)</h3>
+<pre>/opt/ecspve/pve-install.sh --pull             # Update: neuesten Stand holen, Container und Helfer erneuern
+ecspve-helfer uebersicht | head -c 400        # Helfer von Hand testen
+journalctl -u 'ecspve-*' -n 50                # Protokoll der Aufträge (Updates, Neustarts)
+pct enter CTID                                # Konsole im Container</pre>
+<h3>Im Container</h3>
+<pre>ecspve status                   # Übersicht im Terminal
+ecspve verbindung               # erreicht der Container den Helfer?
+ecspve passwort                 # Passwort der Weboberfläche neu setzen
+ecspve token --neu              # neues Token für Monitoring-Abfragen
+systemctl list-timers ecspve-nacht.timer   # nächster Nachtlauf
+journalctl -u ecspve -f         # Protokoll live (Strg+C beendet)</pre>
+<h2>Eigene Notizen</h2>
+<p></p>

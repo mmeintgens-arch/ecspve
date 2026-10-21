@@ -1,0 +1,12 @@
+[Unit]
+Description=ECS Proxmox – nächtliche Updates der ausgewählten Container
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ecspve
+Group=ecspve
+ExecStart=/usr/bin/python3 /opt/ecspve/ecspve.py nacht
+TimeoutStartSec=6h
+NoNewPrivileges=true
+UMask=0027
