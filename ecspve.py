@@ -12,6 +12,9 @@ Helfer aufrufen darf.
   ecspve token [--neu]   Token für Monitoring-Abfragen anzeigen bzw. neu erzeugen
   ecspve ping            prüft, ob die Weboberfläche antwortet
   ecspve verbindung      prüft die Verbindung zum Helfer auf dem Proxmox-Host
+  ecspve zwei-faktor [zuruecksetzen]
+                         Stand des zweiten Faktors; zuruecksetzen = Handy verloren und keine Notfallcodes mehr:
+                         bei der nächsten Anmeldung wird eine neue Authenticator-App eingerichtet
 """
 
 import base64
@@ -23,9 +26,11 @@ import hmac
 import http.server
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
+import struct
 import subprocess
 import sys
 import threading
@@ -44,14 +49,25 @@ PASS_FILE = CONF_DIR / "passwort"
 SSH_DIR = CONF_DIR / "ssh"
 EINST_FILE = STATE_DIR / "gaeste.json"
 NACHT_FILE = STATE_DIR / "nacht.json"
+ZF_FILE = STATE_DIR / "zwei-faktor.json"
+SICHERHEIT_FILE = STATE_DIR / "sicherheit.jsonl"
 
 VORGABEN = {
     "PVE_HOST": "", "PVE_URL": "", "ADRESSE": "0.0.0.0", "PORT": "8080", "TOKEN": "", "PROXY_IP": "",
     "SNAPSHOTS_BEHALTEN": "2", "NEUSTART_NACH_UPDATE": "nein", "HOST_AUTO_UPDATE": "nein",
     "MELDUNG_URL": "", "MELDUNG_TOKEN": "", "HEARTBEAT_URL": "", "HEALTH_DETAILS": "nein",
+    "MELDUNG_ANMELDUNG": "ja", "TOKEN_IN_URL": "nein",
 }
-SITZUNG_DAUER = 12 * 3600
+SITZUNG_LEERLAUF = 30 * 60      # so lange ohne Anfrage gültig – die offene Seite fragt alle 10 Sekunden
+SITZUNG_HOECHSTENS = 12 * 3600  # danach immer neu anmelden
+VORSTUFE_DAUER = 5 * 60         # Passwort stimmt, Code fehlt noch
+SPERRE_FENSTER = 15 * 60
+SPERRE_IP = 5                   # Fehlversuche je IP im Fenster
+SPERRE_GESAMT = 30              # Fehlversuche aller IPs zusammen im Fenster
+SPERRE_CODES = 10               # falsche Codes nach richtigem Passwort je Stunde – dann ist das Passwort wohl bekannt
+PASSWORT_MIN = 12
 PBKDF2_RUNDEN = 600_000
+NOTFALL_ZEICHEN = "abcdefghjkmnpqrstuvwxyz23456789"
 AUFTRAG_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,120}\.service$")
 
@@ -371,7 +387,7 @@ class Sammler:
         return bool(laufende)
 
 
-# --- Anmeldung ------------------------------------------------------------------------------------------
+# --- Anmeldung: Passwort und zweiter Faktor --------------------------------------------------------------
 
 def passwort_hash(passwort):
     salz = secrets.token_bytes(16)
@@ -390,41 +406,236 @@ def passwort_pruefen(passwort):
     return hmac.compare_digest(probe, base64.b64decode(wert))
 
 
+def totp(geheim, schritt):
+    """Sechsstelliger Code nach RFC 6238 (SHA-1, 30 Sekunden) – wie in jeder Authenticator-App."""
+    schluessel = base64.b32decode(geheim + "=" * (-len(geheim) % 8))
+    digest = hmac.new(schluessel, struct.pack(">Q", schritt), hashlib.sha1).digest()
+    versatz = digest[-1] & 0x0F
+    return f"{(struct.unpack('>I', digest[versatz:versatz + 4])[0] & 0x7FFFFFFF) % 1_000_000:06d}"
+
+
+def totp_schritt(geheim, code, jetzt=None):
+    """Zeitschritt, zu dem der Code passt (eine halbe Minute Uhrabweichung erlaubt), sonst None."""
+    basis = int((time.time() if jetzt is None else jetzt) // 30)
+    treffer = None
+    for schritt in (basis - 1, basis, basis + 1):
+        if hmac.compare_digest(totp(geheim, schritt), code):
+            treffer = schritt
+    return treffer
+
+
+def neues_geheimnis():
+    return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def notfall_hash(code):
+    return hashlib.sha256(f"ecspve-notfall:{code}".encode()).hexdigest()
+
+
+def neue_notfallcodes(anzahl=8):
+    codes = ["".join(secrets.choice(NOTFALL_ZEICHEN) for _ in range(10)) for _ in range(anzahl)]
+    return [f"{c[:5]}-{c[5:]}" for c in codes], [notfall_hash(c) for c in codes]
+
+
+ZF_LOCK = threading.Lock()
+
+
+def zf_laden():
+    daten = lies_json(ZF_FILE, None)
+    return daten if isinstance(daten, dict) and daten.get("geheim") else None
+
+
+def zf_speichern(daten):
+    ZF_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ZF_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(daten), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(ZF_FILE)
+
+
+def code_pruefen(code, anmeldung=False):
+    """Prüft einen Code aus der App oder einen Notfallcode und gibt "app", "notfall" oder None zurück.
+
+    Notfallcodes gelten nur einmal. Bei der Anmeldung gilt auch ein App-Code nur einmal – wer ihn mitliest,
+    kann ihn nicht noch einmal benutzen."""
+    code = re.sub(r"[\s-]", "", str(code or "")).lower()
+    with ZF_LOCK:
+        daten = zf_laden()
+        if not daten:
+            return None
+        if re.fullmatch(r"[0-9]{6}", code):
+            schritt = totp_schritt(daten["geheim"], code)
+            if schritt is None or (anmeldung and schritt <= daten.get("letzter_schritt", 0)):
+                return None
+            if anmeldung:
+                daten["letzter_schritt"] = schritt
+                zf_speichern(daten)
+            return "app"
+        if re.fullmatch(f"[{NOTFALL_ZEICHEN}]{{10}}", code):
+            gesucht = notfall_hash(code)
+            for i, gespeichert in enumerate(daten.get("notfall", [])):
+                if hmac.compare_digest(gespeichert, gesucht):
+                    del daten["notfall"][i]
+                    zf_speichern(daten)
+                    return "notfall"
+        return None
+
+
+def anmeldestand():
+    """Ändert sich, wenn Passwort oder zweiter Faktor neu gesetzt werden – ältere Sitzungen gelten dann nicht mehr."""
+    try:
+        passwort = PASS_FILE.stat().st_mtime_ns
+    except OSError:
+        passwort = None
+    zf = zf_laden()
+    return passwort, zf.get("seit") if zf else None
+
+
+def qr_bild(text):
+    """QR-Code als SVG (Debian-Paket qrencode) – ohne das Paket zeigt die Seite nur den Schlüssel."""
+    try:
+        p = subprocess.run(["qrencode", "-t", "SVG", "-l", "M", "-m", "2", "-o", "-", text],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0 or b"<svg" not in p.stdout:
+        return None
+    return "data:image/svg+xml;base64," + base64.b64encode(p.stdout).decode()
+
+
+def einrichtung(geheim):
+    aussteller = urllib.parse.quote("ECS Proxmox")
+    uri = (f"otpauth://totp/{aussteller}:{urllib.parse.quote('Übersicht')}?secret={geheim}&issuer={aussteller}"
+           "&digits=6&period=30")
+    return {"geheim": " ".join(geheim[i:i + 4] for i in range(0, len(geheim), 4)), "uri": uri, "qr": qr_bild(uri)}
+
+
+EREIGNIS_LOCK = threading.Lock()
+
+
+def ereignis(ip, text, ok=True):
+    """Sicherheitsprotokoll: Anmeldungen, Fehlversuche, Sperren, Änderungen und Aktionen – mit IP."""
+    log(f"{'' if ok else 'WARNUNG '}Sicherheit: {text} ({ip})")
+    eintrag = json.dumps({"zeit": time.time(), "ip": ip, "text": text, "ok": ok}, ensure_ascii=False)
+    with EREIGNIS_LOCK:
+        try:
+            SICHERHEIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(SICHERHEIT_FILE, "a", encoding="utf-8") as f:
+                f.write(eintrag + "\n")
+            if os.geteuid() == 0:  # root auf der Kommandozeile: Datei bleibt beim Dienst
+                try:
+                    nutzer = pwd.getpwnam("ecspve")
+                    os.chown(SICHERHEIT_FILE, nutzer.pw_uid, nutzer.pw_gid)
+                except (KeyError, OSError):
+                    pass
+            if SICHERHEIT_FILE.stat().st_size > 300_000:
+                zeilen = SICHERHEIT_FILE.read_text(encoding="utf-8").splitlines()[-1000:]
+                SICHERHEIT_FILE.write_text("\n".join(zeilen) + "\n", encoding="utf-8")
+        except OSError as e:
+            log(f"Sicherheitsprotokoll nicht schreibbar: {e}")
+
+
+def letzte_ereignisse(anzahl=15):
+    try:
+        zeilen = SICHERHEIT_FILE.read_text(encoding="utf-8").splitlines()[-anzahl:]
+    except OSError:
+        return []
+    liste = []
+    for zeile in reversed(zeilen):
+        try:
+            liste.append(json.loads(zeile))
+        except ValueError:
+            pass
+    return liste
+
+
 class Anmeldung:
+    """Sitzungen (nur im Speicher – ein Neustart meldet alle ab) und Sperren nach Fehlversuchen."""
+
     def __init__(self):
         self.lock = threading.Lock()
         self.sitzungen = {}
         self.fehlversuche = {}
+        self.falsche_codes = []
 
-    def neu(self):
+    def neu(self, stufe, ip):
         token = secrets.token_urlsafe(32)
+        jetzt = time.time()
+        stand = anmeldestand()
         with self.lock:
-            jetzt = time.time()
-            self.sitzungen = {t: b for t, b in self.sitzungen.items() if b > jetzt}
-            self.sitzungen[token] = jetzt + SITZUNG_DAUER
+            self.sitzungen = {t: s for t, s in self.sitzungen.items() if self._gueltig(s, jetzt, stand)}
+            self.sitzungen[token] = {"stufe": stufe, "start": jetzt, "aktiv": jetzt, "ip": ip, "stand": stand}
         return token
 
-    def gueltig(self, token):
+    @staticmethod
+    def _gueltig(s, jetzt, stand):
+        dauer = SITZUNG_HOECHSTENS if s["stufe"] == "voll" else VORSTUFE_DAUER
+        return jetzt - s["start"] < dauer and jetzt - s["aktiv"] < SITZUNG_LEERLAUF and s["stand"] == stand
+
+    def hole(self, token):
+        """Die Sitzung zum Token – None, wenn abgelaufen oder Passwort/zweiter Faktor inzwischen geändert."""
+        if not token:
+            return None
+        stand = anmeldestand()
         with self.lock:
-            bis = self.sitzungen.get(token or "")
-            if not bis or bis < time.time():
-                return False
-            self.sitzungen[token] = time.time() + SITZUNG_DAUER
-            return True
+            s = self.sitzungen.get(token)
+            if not s:
+                return None
+            jetzt = time.time()
+            if not self._gueltig(s, jetzt, stand):
+                del self.sitzungen[token]
+                return None
+            s["aktiv"] = jetzt
+            return s
 
     def ende(self, token):
         with self.lock:
             self.sitzungen.pop(token or "", None)
 
-    def gesperrt(self, ip):
+    def alle_beenden(self, ausser=None):
         with self.lock:
-            versuche = [t for t in self.fehlversuche.get(ip, []) if t > time.time() - 900]
-            self.fehlversuche[ip] = versuche
-            return len(versuche) >= 5
+            self.sitzungen = {t: s for t, s in self.sitzungen.items() if t == ausser}
+
+    def angemeldet(self):
+        jetzt, stand = time.time(), anmeldestand()
+        with self.lock:
+            return sum(1 for s in self.sitzungen.values() if s["stufe"] == "voll" and self._gueltig(s, jetzt, stand))
+
+    def gesperrt(self, ip):
+        """"ip", wenn diese IP zu oft falsch lag, "gesamt" bei vielen Fehlversuchen von überall, sonst None."""
+        grenze = time.time() - SPERRE_FENSTER
+        with self.lock:
+            self.fehlversuche = {k: [t for t in v if t > grenze] for k, v in self.fehlversuche.items()}
+            self.fehlversuche = {k: v for k, v in self.fehlversuche.items() if v}
+            if len(self.fehlversuche.get(ip, [])) >= SPERRE_IP:
+                return "ip"
+            if sum(len(v) for v in self.fehlversuche.values()) >= SPERRE_GESAMT:
+                return "gesamt"
+            return None
 
     def fehlversuch(self, ip):
+        """Zählt einen Fehlversuch; True, wenn damit gerade eine Sperre beginnt."""
+        vorher = self.gesperrt(ip)
         with self.lock:
             self.fehlversuche.setdefault(ip, []).append(time.time())
+        return vorher is None and self.gesperrt(ip) is not None
+
+    def erfolg(self, ip):
+        with self.lock:
+            self.fehlversuche.pop(ip, None)
+
+    def codes_gesperrt(self):
+        """Zu viele falsche Codes nach richtigem Passwort (egal von wo): Code-Schritt für eine Stunde zu."""
+        with self.lock:
+            self.falsche_codes = [t for t in self.falsche_codes if t > time.time() - 3600]
+            return len(self.falsche_codes) >= SPERRE_CODES
+
+    def falscher_code(self):
+        """Zählt einen falschen Code nach richtigem Passwort; True, wenn damit die Sperre beginnt."""
+        vorher = self.codes_gesperrt()
+        with self.lock:
+            self.falsche_codes.append(time.time())
+        return not vorher and self.codes_gesperrt()
 
 
 # --- Monitoring ------------------------------------------------------------------------------------------
@@ -497,13 +708,21 @@ def metriken(st):
 
 STATISCH = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/app.css": ("app.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml")}
+OFFEN = ("/ping", "/health")  # auch ohne Umweg über den Reverse Proxy erreichbar
 CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; "
-       "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+       "object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+SICHERHEITS_KOPF = {
+    "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": CSP, "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+}
 
 
 class Anfrage(http.server.BaseHTTPRequestHandler):
     server_version = "ecspve"
     sys_version = ""
+    timeout = 30  # langsame oder hängende Verbindungen nicht ewig offen halten
     sammler: Sammler = None
     anmeldung: Anmeldung = None
     einst_lock = threading.Lock()
@@ -520,9 +739,10 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", typ)
         self.send_header("Content-Length", str(len(roh)))
         self.send_header("Cache-Control", "no-store" if typ.startswith("application/json") else "no-cache")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "same-origin")
-        self.send_header("Content-Security-Policy", CSP)
+        for k, v in SICHERHEITS_KOPF.items():
+            self.send_header(k, v)
+        if self.https():
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         for k, v in (kopf or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -532,34 +752,76 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
     def fehler(self, code, text):
         self.senden(code, {"fehler": text})
 
-    # Wer fragt?
+    # Wer fragt, auf welchem Weg?
+    def proxies(self):
+        return [p.strip() for p in lade_konfig()["PROXY_IP"].split(",") if p.strip()]
+
+    def vom_proxy(self):
+        return self.client_address[0] in self.proxies()
+
     def client_ip(self):
         ip = self.client_address[0]
-        proxies = [p.strip() for p in lade_konfig()["PROXY_IP"].split(",") if p.strip()]
         weiter = self.headers.get("X-Forwarded-For", "")
-        if ip in proxies and weiter:
+        if self.vom_proxy() and weiter:
             ip = weiter.split(",")[-1].strip()
         return ip
 
-    def sitzung(self):
+    def https(self):
+        return self.vom_proxy() and self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+    def zugang(self, pfad):
+        """Ist PROXY_IP gesetzt, geht alles außer /ping und /health nur über den Reverse Proxy. Gesperrte IPs
+        bekommen nur noch die Seite selbst, keine Daten."""
+        if pfad in OFFEN:
+            return True
+        lokal = self.client_address[0] in ("127.0.0.1", "::1")
+        if self.proxies() and not self.vom_proxy() and not lokal:
+            self.fehler(403, "Bitte über die HTTPS-Adresse eures Reverse Proxys aufrufen.")
+            return False
+        if pfad not in STATISCH and self.anmeldung.gesperrt(self.client_ip()) == "ip":
+            self.fehler(429, "Zu viele Fehlversuche von dieser Adresse – bitte 15 Minuten warten.")
+            return False
+        return True
+
+    def token_der_sitzung(self):
         for teil in self.headers.get("Cookie", "").split(";"):
             name, _, wert = teil.strip().partition("=")
             if name == "ecspve":
                 return wert
         return ""
 
+    def sitzung(self):
+        return self.anmeldung.hole(self.token_der_sitzung())
+
     def angemeldet(self):
-        return self.anmeldung.gueltig(self.sitzung())
+        s = self.sitzung()
+        return s if s and s["stufe"] == "voll" else None
 
     def token_ok(self):
-        token = lade_konfig()["TOKEN"]
-        if not token:
+        konf = lade_konfig()
+        if not konf["TOKEN"]:
             return False
         geliefert = self.headers.get("Authorization", "")
         geliefert = geliefert[7:].strip() if geliefert.lower().startswith("bearer ") else ""
-        if not geliefert:
+        if not geliefert and ja(konf["TOKEN_IN_URL"]):
             geliefert = (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("token") or [""])[0]
-        return bool(geliefert) and hmac.compare_digest(geliefert.encode(), token.encode())
+        if not geliefert:
+            return False
+        if hmac.compare_digest(geliefert.encode(), konf["TOKEN"].encode()):
+            return True
+        self.fehlversuch("Falsches Monitoring-Token")
+        return False
+
+    def fehlversuch(self, text):
+        ip = self.client_ip()
+        ereignis(ip, text, ok=False)
+        if self.anmeldung.fehlversuch(ip):
+            art = self.anmeldung.gesperrt(ip)
+            text = (f"{SPERRE_IP} Fehlversuche von {ip} – diese Adresse ist 15 Minuten gesperrt." if art == "ip" else
+                    f"{SPERRE_GESAMT} Fehlversuche von verschiedenen Adressen – Anmeldung für alle 15 Minuten gesperrt.")
+            ereignis(ip, text, ok=False)
+            threading.Thread(target=melden, args=("Anmeldesperre an der Übersicht", text, True), daemon=True).start()
+        time.sleep(1)  # bremst Durchprobieren zusätzlich
 
     def body(self):
         laenge = int(self.headers.get("Content-Length") or 0)
@@ -576,6 +838,8 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         pfad = urllib.parse.urlsplit(self.path).path
+        if not self.zugang(pfad):
+            return
         if pfad in STATISCH:
             datei, typ = STATISCH[pfad]
             try:
@@ -592,6 +856,11 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
             if ja(lade_konfig()["HEALTH_DETAILS"]) or self.token_ok() or self.angemeldet():
                 text += "".join(f"- {p['text']}\n" for p in st["probleme"])
             return self.senden(503, text, "text/plain; charset=utf-8")
+        if pfad == "/api/sitzung":
+            s = self.sitzung()
+            # Ob der zweite Faktor schon steht, erfährt nur, wer das Passwort kennt
+            return self.senden(200, {"stufe": s["stufe"] if s else None,
+                                     "zwei_faktor": zf_laden() is not None if s else None})
         sitzung = self.angemeldet()
         if not sitzung and not self.token_ok():
             return self.fehler(401, "Bitte anmelden.")
@@ -600,7 +869,14 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
             if sitzung:
                 self.sammler.besuch()
                 konf = lade_konfig()
-                st["schnittstellen"] = {"token": konf["TOKEN"], "pve_url": konf["PVE_URL"]}
+                zf = zf_laden() or {}
+                st["schnittstellen"] = {"token": konf["TOKEN"], "pve_url": konf["PVE_URL"],
+                                        "token_in_url": ja(konf["TOKEN_IN_URL"])}
+                st["sicherheit"] = {
+                    "zwei_faktor_seit": zf.get("seit"), "notfall_uebrig": len(zf.get("notfall", [])),
+                    "sitzungen": self.anmeldung.angemeldet(), "nur_proxy": bool(self.proxies()), "https": self.https(),
+                    "ereignisse": letzte_ereignisse(15),
+                }
             return self.senden(200, st)
         if pfad == "/metrics":
             return self.senden(200, metriken(self.sammler.status()), "text/plain; version=0.0.4; charset=utf-8")
@@ -618,64 +894,189 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         return self.fehler(404, "nicht gefunden")
 
     # POST
+    def herkunft_ok(self):
+        """Eigener Header (kann ein fremdes Formular nicht setzen) und – falls mitgeschickt – passende Herkunft."""
+        if self.headers.get("X-ECSPVE") != "1":
+            return False
+        herkunft = self.headers.get("Origin")
+        if not herkunft:
+            return True
+        erlaubt = {self.headers.get("Host", "")}
+        if self.vom_proxy():
+            erlaubt.add(self.headers.get("X-Forwarded-Host", ""))
+        return urllib.parse.urlsplit(herkunft).netloc in erlaubt - {""}
+
     def do_POST(self):
         pfad = urllib.parse.urlsplit(self.path).path
-        # Eigener Header: ein fremdes Formular kann ihn nicht mitschicken (Schutz vor CSRF)
-        if self.headers.get("X-ECSPVE") != "1":
+        if not self.zugang(pfad):
+            return
+        if not self.herkunft_ok():
             return self.fehler(403, "Anfrage abgelehnt.")
         try:
             daten = self.body()
         except (ValueError, UnicodeDecodeError):
             return self.fehler(400, "Ungültige Anfrage.")
-        if pfad == "/api/anmelden":
-            return self.anmelden(daten)
+        anmelde_schritte = {"/api/anmelden": self.anmelden, "/api/anmelden/code": self.anmelden_code,
+                            "/api/zwei-faktor/start": self.zf_start, "/api/zwei-faktor/bestaetigen": self.zf_bestaetigen}
+        if pfad in anmelde_schritte:
+            return anmelde_schritte[pfad](daten)
         if pfad == "/api/abmelden":
-            self.anmeldung.ende(self.sitzung())
+            self.anmeldung.ende(self.token_der_sitzung())
             return self.senden(200, {"ok": True}, kopf={"Set-Cookie": self.cookie("", 0)})
         if not self.angemeldet():
             return self.fehler(401, "Bitte anmelden.")
+        aktionen = {"/api/aktion": self.aktion, "/api/host": self.host_aktion, "/api/auto": self.auto,
+                    "/api/alle": lambda d: self.alle_aktualisieren(), "/api/anlegen": self.anlegen,
+                    "/api/pruefung": self.pruefung, "/api/pruefen": self.pruefen,
+                    "/api/zwei-faktor/geraet": self.zf_geraet, "/api/zwei-faktor/notfallcodes": self.zf_notfallcodes,
+                    "/api/sitzungen/beenden": self.sitzungen_beenden}
+        if pfad not in aktionen:
+            return self.fehler(404, "nicht gefunden")
         try:
-            if pfad == "/api/aktion":
-                erg = self.aktion(daten)
-            elif pfad == "/api/host":
-                erg = self.host_aktion(daten)
-            elif pfad == "/api/auto":
-                erg = self.auto(daten)
-            elif pfad == "/api/alle":
-                erg = self.alle_aktualisieren()
-            elif pfad == "/api/anlegen":
-                erg = self.anlegen(daten)
-            elif pfad == "/api/pruefung":
-                erg = self.pruefung(daten)
-            elif pfad == "/api/pruefen":
-                self.sammler.pruef_wecker.set()
-                self.sammler.wecker.set()
-                erg = {"ok": True}
-            else:
-                return self.fehler(404, "nicht gefunden")
+            erg = aktionen[pfad](daten)
         except HelferFehler as e:
             return self.fehler(409, str(e))
+        except Verweigert as e:
+            return self.fehler(403, str(e))
         except (KeyError, TypeError, ValueError):
             return self.fehler(400, "Ungültige Anfrage.")
+        if pfad not in ("/api/pruefen", "/api/zwei-faktor/geraet", "/api/zwei-faktor/notfallcodes",
+                        "/api/sitzungen/beenden"):
+            ereignis(self.client_ip(), aktion_text(pfad, daten, self.sammler))
         self.sammler.auftrag_eintragen(erg)
         self.sammler.wecker.set()
         return self.senden(200, erg)
 
     def cookie(self, wert, alter):
-        sicher = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        sicher = "; Secure" if self.https() else ""
         return f"ecspve={wert}; Path=/; Max-Age={alter}; HttpOnly; SameSite=Strict{sicher}"
+
+    # Anmeldung in zwei Schritten
+    def anmelde_sperre(self):
+        art = self.anmeldung.gesperrt(self.client_ip())
+        if art == "ip":
+            return "Zu viele Fehlversuche von dieser Adresse – bitte 15 Minuten warten."
+        if art == "gesamt":
+            return "Zu viele Fehlversuche – die Anmeldung ist für alle 15 Minuten gesperrt."
+        return None
 
     def anmelden(self, daten):
         ip = self.client_ip()
+        if self.proxies() and not self.https() and self.client_address[0] not in ("127.0.0.1", "::1"):
+            return self.fehler(403, "Anmeldung nur über HTTPS.")
         if not PASS_FILE.exists():
             return self.fehler(503, "Noch kein Passwort gesetzt – im Container „ecspve passwort“ ausführen.")
-        if self.anmeldung.gesperrt(ip):
-            return self.fehler(429, "Zu viele Fehlversuche – bitte 15 Minuten warten.")
-        if not passwort_pruefen(str(daten.get("passwort", ""))):
-            self.anmeldung.fehlversuch(ip)
-            log(f"Fehlgeschlagene Anmeldung von {ip}")
+        sperre = self.anmelde_sperre()
+        if sperre:
+            return self.fehler(429, sperre)
+        if not passwort_pruefen(str(daten.get("passwort", ""))[:1024]):
+            self.fehlversuch("Passwort falsch")
             return self.fehler(403, "Passwort falsch.")
-        return self.senden(200, {"ok": True}, kopf={"Set-Cookie": self.cookie(self.anmeldung.neu(), SITZUNG_DAUER)})
+        token = self.anmeldung.neu("passwort", ip)
+        schritt = "code" if zf_laden() else "einrichten"
+        return self.senden(200, {"schritt": schritt}, kopf={"Set-Cookie": self.cookie(token, VORSTUFE_DAUER)})
+
+    def voll_anmelden(self, text):
+        """Nach Passwort und zweitem Faktor: neue Sitzung (neues Token – das alte ist damit wertlos)."""
+        ip = self.client_ip()
+        self.anmeldung.ende(self.token_der_sitzung())
+        self.anmeldung.erfolg(ip)
+        ereignis(ip, text)
+        if ja(lade_konfig()["MELDUNG_ANMELDUNG"]):
+            threading.Thread(target=melden, args=("Anmeldung an der Übersicht", f"{text} von {ip}"), daemon=True).start()
+        return self.cookie(self.anmeldung.neu("voll", ip), SITZUNG_HOECHSTENS)
+
+    def anmelden_code(self, daten):
+        s = self.sitzung()
+        if not s or s["stufe"] != "passwort" or not zf_laden():
+            return self.fehler(401, "Bitte zuerst das Passwort eingeben.")
+        sperre = self.anmelde_sperre()
+        if sperre:
+            return self.fehler(429, sperre)
+        if self.anmeldung.codes_gesperrt():
+            return self.fehler(429, "Zu viele falsche Codes – die Anmeldung ist für eine Stunde gesperrt.")
+        art = code_pruefen(daten.get("code"), anmeldung=True)
+        if not art:
+            if self.anmeldung.falscher_code():
+                text = (f"{SPERRE_CODES} falsche Codes nach richtigem Passwort innerhalb einer Stunde – das Passwort ist "
+                        "vermutlich bekannt. Anmeldung für eine Stunde gesperrt. Bitte im Container „ecspve passwort“ "
+                        "ausführen.")
+                ereignis(self.client_ip(), text, ok=False)
+                threading.Thread(target=melden, args=("Passwort der Übersicht vermutlich bekannt", text, True),
+                                 daemon=True).start()
+            self.fehlversuch("Passwort richtig, Code falsch")
+            return self.fehler(403, "Code falsch oder schon benutzt – bitte den nächsten Code der App nehmen.")
+        cookie = self.voll_anmelden("Anmeldung mit Notfallcode" if art == "notfall" else "Anmeldung")
+        uebrig = len((zf_laden() or {}).get("notfall", []))
+        return self.senden(200, {"ok": True, "notfall": art == "notfall", "notfall_uebrig": uebrig},
+                           kopf={"Set-Cookie": cookie})
+
+    def zf_start(self, daten):
+        """Neues Geheimnis für die App: beim ersten Mal nach dem Passwort, später nur mit gültigem Code."""
+        s = self.sitzung()
+        if not s:
+            return self.fehler(401, "Bitte anmelden.")
+        if s["stufe"] == "voll":
+            if not code_pruefen(daten.get("code")):
+                self.fehlversuch("Code falsch (zweiten Faktor neu einrichten)")
+                return self.fehler(403, "Code falsch.")
+        elif zf_laden():
+            return self.fehler(403, "Der zweite Faktor ist schon eingerichtet – bitte den Code eingeben.")
+        s["neu_geheim"] = neues_geheimnis()
+        return self.senden(200, einrichtung(s["neu_geheim"]))
+
+    def zf_bestaetigen(self, daten):
+        s = self.sitzung()
+        if not s or not s.get("neu_geheim"):
+            return self.fehler(401, "Bitte die Einrichtung neu beginnen.")
+        sperre = self.anmelde_sperre()
+        if sperre:
+            return self.fehler(429, sperre)
+        code = re.sub(r"\s", "", str(daten.get("code") or ""))
+        schritt = totp_schritt(s["neu_geheim"], code) if re.fullmatch(r"[0-9]{6}", code) else None
+        if schritt is None:
+            self.fehlversuch("Code falsch (Einrichtung des zweiten Faktors)")
+            return self.fehler(403, "Der Code passt nicht. Stimmt die Uhrzeit auf dem Handy?")
+        codes, hashes = neue_notfallcodes()
+        with ZF_LOCK:
+            zf_speichern({"geheim": s["neu_geheim"], "seit": time.time(), "letzter_schritt": schritt, "notfall": hashes})
+        # Alle bisherigen Sitzungen gelten ab jetzt nicht mehr (anmeldestand hat sich geändert)
+        cookie = self.voll_anmelden("Zweiter Faktor eingerichtet, angemeldet")
+        threading.Thread(target=melden, args=("Zweiter Faktor neu eingerichtet",
+                                              f"Neue Authenticator-App für die Übersicht, von {self.client_ip()}", True),
+                         daemon=True).start()
+        return self.senden(200, {"notfallcodes": codes}, kopf={"Set-Cookie": cookie})
+
+    def code_verlangen(self, daten, wofuer):
+        if not code_pruefen(daten.get("code")):
+            self.fehlversuch(f"Code falsch ({wofuer})")
+            raise Verweigert("Code falsch.")
+
+    def zf_geraet(self, daten):
+        """QR-Code des bestehenden Geheimnisses für ein weiteres Handy – nur mit gültigem Code."""
+        self.code_verlangen(daten, "weiteres Gerät")
+        ereignis(self.client_ip(), "QR-Code für ein weiteres Gerät angezeigt")
+        return einrichtung((zf_laden() or {})["geheim"])
+
+    def zf_notfallcodes(self, daten):
+        self.code_verlangen(daten, "neue Notfallcodes")
+        codes, hashes = neue_notfallcodes()
+        with ZF_LOCK:
+            zf = zf_laden()
+            zf["notfall"] = hashes
+            zf_speichern(zf)
+        ereignis(self.client_ip(), "Neue Notfallcodes erzeugt – die alten gelten nicht mehr")
+        return {"notfallcodes": codes}
+
+    def sitzungen_beenden(self, daten):
+        self.anmeldung.alle_beenden(ausser=self.token_der_sitzung())
+        ereignis(self.client_ip(), "Alle anderen Sitzungen abgemeldet")
+        return {"ok": True}
+
+    def pruefen(self, daten):
+        self.sammler.pruef_wecker.set()
+        self.sammler.wecker.set()
+        return {"ok": True}
 
     def gast(self, daten):
         gid = int(daten["id"])
@@ -754,6 +1155,34 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
             except HelferFehler as e:
                 fehler.append(f"{g['name']}: {e}")
         return {"auftraege": gestartet, "fehler": fehler}
+
+
+class Verweigert(Exception):
+    pass
+
+
+def aktion_text(pfad, daten, sammler):
+    """Kurze Beschreibung einer Aktion für das Sicherheitsprotokoll."""
+    namen = {g["id"]: g["name"] for g in sammler.status()["gaeste"]}
+    try:
+        gast = f"{namen.get(int(daten.get('id')), daten.get('id'))}" if daten.get("id") is not None else ""
+    except (TypeError, ValueError):
+        gast = ""
+    if pfad == "/api/aktion":
+        was = daten.get("dienst") or daten.get("was") or ""
+        return f"Aktion {daten.get('aktion')} {was} – {gast}".replace("  ", " ")
+    if pfad == "/api/host":
+        return f"Host: {daten.get('aktion')}"
+    if pfad == "/api/auto":
+        an = {k: "an" if daten.get(k) else "aus" for k in ("system", "app")}
+        return f"Nachts automatisch für {gast}: System {an['system']}, App {an['app']}"
+    if pfad == "/api/anlegen":
+        return f"Container anlegen: {str(daten.get('name'))[:63]}"
+    if pfad == "/api/pruefung":
+        return f"Funktionsprüfung für {gast}: {str(daten.get('adresse') or 'aus')[:200]}"
+    if pfad == "/api/alle":
+        return "Alle Container aktualisieren"
+    return pfad
 
 
 class Webserver(http.server.ThreadingHTTPServer):
@@ -877,11 +1306,11 @@ def cmd_passwort(args):
     if "--stdin" in args:
         passwort = sys.stdin.readline().rstrip("\n")
     else:
-        passwort = getpass.getpass("Neues Passwort für die Übersicht (mind. 10 Zeichen): ")
+        passwort = getpass.getpass(f"Neues Passwort für die Übersicht (mind. {PASSWORT_MIN} Zeichen): ")
         if getpass.getpass("Wiederholen: ") != passwort:
             sys.exit("Die Passwörter stimmen nicht überein.")
-    if len(passwort) < 10:
-        sys.exit("Das Passwort muss mindestens 10 Zeichen lang sein.")
+    if len(passwort) < PASSWORT_MIN:
+        sys.exit(f"Das Passwort muss mindestens {PASSWORT_MIN} Zeichen lang sein.")
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     tmp = PASS_FILE.with_suffix(".tmp")
     tmp.write_text(passwort_hash(passwort) + "\n", encoding="utf-8")
@@ -891,7 +1320,31 @@ def cmd_passwort(args):
     except (KeyError, PermissionError):
         pass
     tmp.replace(PASS_FILE)
-    print("Passwort gesetzt.")
+    ereignis("Kommandozeile", "Passwort neu gesetzt – alle Sitzungen abgemeldet")
+    print("Passwort gesetzt. Alle Sitzungen sind damit abgemeldet.")
+
+
+def cmd_zwei_faktor(args):
+    zf = zf_laden()
+    if args[:1] == ["zuruecksetzen"]:
+        if not zf:
+            print("Der zweite Faktor ist nicht eingerichtet – bei der nächsten Anmeldung wird er eingerichtet.")
+            return 0
+        ZF_FILE.unlink()
+        ereignis("Kommandozeile", "Zweiter Faktor zurückgesetzt – alle Sitzungen abgemeldet", ok=False)
+        melden("Zweiter Faktor zurückgesetzt", "Auf der Kommandozeile im Container der Übersicht. Bei der nächsten "
+               "Anmeldung wird eine neue Authenticator-App eingerichtet.", True)
+        print("Zurückgesetzt. Bei der nächsten Anmeldung (Passwort) wird eine neue Authenticator-App eingerichtet.")
+        return 0
+    if args:
+        print(f"Unbekannt: {' '.join(args)} – möglich ist: ecspve zwei-faktor zuruecksetzen", file=sys.stderr)
+        return 2
+    if not zf:
+        print("Zweiter Faktor: noch nicht eingerichtet – das passiert bei der nächsten Anmeldung.")
+    else:
+        print(f"Zweiter Faktor: eingerichtet seit {time.strftime('%d.%m.%Y %H:%M', time.localtime(zf['seit']))}, "
+              f"{len(zf.get('notfall', []))} Notfallcodes übrig.")
+    return 0
 
 
 def cmd_token(args):
@@ -955,6 +1408,8 @@ def main():
         cmd_passwort(rest)
     elif befehl == "token":
         cmd_token(rest)
+    elif befehl == "zwei-faktor":
+        return cmd_zwei_faktor(rest)
     elif befehl == "ping":
         return cmd_ping()
     elif befehl == "verbindung":

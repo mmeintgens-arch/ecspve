@@ -53,18 +53,61 @@
     <h2>Schnittstellen für Monitoring</h2>
     <div id="schnittstellen"></div>
   </section>
+  <section class="karte">
+    <h2>Sicherheit</h2>
+    <div id="sicherheit"></div>
+  </section>
 </main>
 
 <section id="anmeldung" class="anmeldung" hidden>
-  <form id="anmeldeform" class="karte">
+  <div class="karte anmelde-karte">
     <img src="/favicon.svg" alt="" width="40" height="40">
     <h1>ECS Proxmox</h1>
     <p class="leise-text">Übersicht der Container und Dienste</p>
-    <label for="passwort">Passwort</label>
-    <input id="passwort" type="password" autocomplete="current-password" required>
-    <button type="submit" class="haupt">Anmelden</button>
+
+    <form id="anmeldeform">
+      <label for="passwort">Passwort</label>
+      <input id="passwort" type="password" autocomplete="current-password" required>
+      <button type="submit" class="haupt">Weiter</button>
+    </form>
+
+    <form id="codeform" hidden>
+      <label for="code">Code aus der Authenticator-App</label>
+      <input id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="11" spellcheck="false" required>
+      <p class="leise-text">Handy nicht zur Hand? Hier geht auch einer eurer Notfallcodes (xxxxx-xxxxx) – jeder nur einmal.</p>
+      <button type="submit" class="haupt">Anmelden</button>
+      <button type="button" class="leise" data-neu-anmelden>Zurück zum Passwort</button>
+    </form>
+
+    <div id="einrichten" hidden>
+      <h2>Zweiten Faktor einrichten</h2>
+      <p>Zur Sicherheit braucht die Anmeldung neben dem Passwort einen Code vom Handy. Einmalig einrichten:</p>
+      <ol class="schritte">
+        <li>Eine Authenticator-App öffnen – z. B. Microsoft Authenticator, Google Authenticator, Aegis oder 2FAS.</li>
+        <li>Den QR-Code scannen. Mehrere Leute im Team? Alle scannen jetzt denselben Code.</li>
+        <li>Den 6-stelligen Code aus der App unten eintragen.</li>
+      </ol>
+      <div class="qr"><img id="einrichten-qr" alt="QR-Code für die Authenticator-App" width="220" height="220" hidden></div>
+      <p class="leise-text">Kein Scannen möglich? Schlüssel von Hand eingeben: <code id="einrichten-geheim" class="schluessel"></code>
+        · <a id="einrichten-link" href="#">auf diesem Handy direkt in der App öffnen</a></p>
+      <form id="einrichtenform">
+        <label for="einrichten-code">Code aus der App</label>
+        <input id="einrichten-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" spellcheck="false" required>
+        <button type="submit" class="haupt">Einrichten</button>
+      </form>
+    </div>
+
+    <div id="notfall" hidden>
+      <h2>Eure Notfallcodes</h2>
+      <p>Falls das Handy verloren geht: Mit jedem dieser Codes kommt ihr <strong>einmal</strong> ohne App hinein.
+        Jetzt ausdrucken oder im Passwort-Manager speichern – sie werden nicht noch einmal angezeigt.</p>
+      <ul id="notfall-liste" class="codes"></ul>
+      <button type="button" id="notfall-kopieren">Kopieren</button>
+      <button type="button" id="notfall-weiter" class="haupt">Codes sind gesichert – weiter</button>
+    </div>
+
     <p id="anmeldefehler" class="fehlertext" role="alert"></p>
-  </form>
+  </div>
 </section>
 
 <dialog id="protokoll">
@@ -144,6 +187,28 @@
     <div class="dialog-fuss">
       <button type="button" data-schliessen>Abbrechen</button>
       <button type="submit" class="haupt">Speichern</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="zf-dialog">
+  <form id="zf-form" novalidate>
+    <div class="dialog-kopf">
+      <h2 id="zf-titel">Zweiter Faktor</h2>
+      <button type="button" class="leise" data-schliessen>Schließen</button>
+    </div>
+    <div class="formular">
+      <p id="zf-text"></p>
+      <div id="zf-eingabe">
+        <label class="feld" id="zf-label">Aktueller Code aus der App (oder ein Notfallcode)
+          <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="11" spellcheck="false">
+        </label>
+      </div>
+      <div id="zf-ergebnis"></div>
+      <p class="fehlertext" id="zf-fehler" role="alert"></p>
+    </div>
+    <div class="dialog-fuss">
+      <button type="button" data-schliessen>Schließen</button>
+      <button type="submit" class="haupt" id="zf-knopf">Weiter</button>
     </div>
   </form>
 </dialog>

@@ -18,7 +18,8 @@ pct enter CTID                                # Konsole im Container</pre>
 <h3>Im Container</h3>
 <pre>ecspve status                   # Übersicht im Terminal
 ecspve verbindung               # erreicht der Container den Helfer?
-ecspve passwort                 # Passwort der Weboberfläche neu setzen
+ecspve passwort                 # Passwort der Weboberfläche neu setzen (meldet alle ab)
+ecspve zwei-faktor zuruecksetzen   # Handy weg, keine Notfallcodes: neue App bei der nächsten Anmeldung
 ecspve token --neu              # neues Token für Monitoring-Abfragen
 systemctl list-timers ecspve-nacht.timer   # nächster Nachtlauf
 journalctl -u ecspve -f         # Protokoll live (Strg+C beendet)</pre>

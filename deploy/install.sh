@@ -35,7 +35,7 @@ SSH_DIR=/etc/ecspve/ssh
 say "Pakete installieren"
 export DEBIAN_FRONTEND=noninteractive LC_ALL=C.UTF-8
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends python3 openssh-client ca-certificates curl >/dev/null
+apt-get install -y -qq --no-install-recommends python3 openssh-client ca-certificates curl qrencode >/dev/null
 
 # --- Benutzer, Ordner, Programm ------------------------------------------------------------------------------
 say "Programm nach /opt/ecspve"

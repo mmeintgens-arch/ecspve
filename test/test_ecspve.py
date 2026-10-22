@@ -195,6 +195,16 @@ class HelferBefehle(unittest.TestCase):
         self.assertEqual(warte_auf_auftrag(job["id"])["status"], "ok")
 
 
+GEHEIM = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+
+
+def konfig(**werte):
+    """ecspve.env für einen Test umschreiben (Grundstand aus fake.py plus Werte)."""
+    zeilen = ["PVE_HOST=192.168.10.5", "PORT=8080", "TOKEN=test-token-123"] + [f"{k}={v}" for k, v in werte.items()]
+    (ORDNER / "conf" / "ecspve.env").write_text("\n".join(zeilen) + "\n")
+    ecspve._konf_cache = (0.0, None)
+
+
 class Weboberflaeche(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -202,7 +212,7 @@ class Weboberflaeche(unittest.TestCase):
         cls.sammler = ecspve.Sammler()
         cls.sammler.start()
         ecspve.Anfrage.sammler, ecspve.Anfrage.anmeldung = cls.sammler, ecspve.Anmeldung()
-        cls.server = ecspve.Webserver(("127.0.0.1", 0), ecspve.Anfrage)
+        cls.server = ecspve.Webserver(("0.0.0.0", 0), ecspve.Anfrage)
         cls.port = cls.server.server_address[1]
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         ende = time.time() + 60
@@ -212,6 +222,22 @@ class Weboberflaeche(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+
+    def setUp(self):
+        # Jeder Test mit frischen Sperren, eingerichtetem zweiten Faktor und Grundeinstellungen
+        ecspve.Anfrage.anmeldung = ecspve.Anmeldung()
+        ecspve.zf_speichern({"geheim": GEHEIM, "seit": 1.0, "letzter_schritt": 0,
+                             "notfall": [ecspve.notfall_hash("abcde23456")]})
+        konfig()
+
+    def naechster_code(self):
+        """Ein gültiger, noch nicht benutzter Code (jeder Code gilt bei der Anmeldung nur einmal)."""
+        while True:
+            jetzt = int(time.time() // 30)
+            schritt = max((ecspve.zf_laden() or {}).get("letzter_schritt", 0) + 1, jetzt - 1)
+            if schritt <= jetzt + 1:
+                return ecspve.totp(GEHEIM, schritt)
+            time.sleep(1)
 
     def ruhig(self):
         """Warten, bis kein Auftrag mehr läuft – Gäste mit laufendem Auftrag melden keine Störungen."""
@@ -223,8 +249,8 @@ class Weboberflaeche(unittest.TestCase):
             time.sleep(0.5)
         raise AssertionError("Aufträge laufen noch")
 
-    def anfrage(self, methode, pfad, daten=None, kopf=None):
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+    def anfrage(self, methode, pfad, daten=None, kopf=None, von="127.0.0.1"):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30, source_address=(von, 0))
         kopf = dict(kopf or {})
         body = None
         if daten is not None:
@@ -235,9 +261,16 @@ class Weboberflaeche(unittest.TestCase):
         return r.status, r.read().decode(), dict(r.getheaders())
 
     def anmelden(self):
-        status, _, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
-        self.assertEqual(status, 200)
-        return kopf["Set-Cookie"].split(";")[0]
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        self.assertEqual((status, json.loads(text)["schritt"]), (200, "code"))
+        vorstufe = kopf["Set-Cookie"].split(";")[0]
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": vorstufe})[0], 401)  # Passwort allein reicht nicht
+        status, text, kopf = self.anfrage("POST", "/api/anmelden/code", {"code": self.naechster_code()},
+                                          {"X-ECSPVE": "1", "Cookie": vorstufe})
+        self.assertEqual(status, 200, text)
+        cookie = kopf["Set-Cookie"].split(";")[0]
+        self.assertNotEqual(cookie, vorstufe)  # neues Token nach dem zweiten Faktor
+        return cookie
 
     def test_passwort(self):
         self.assertTrue(ecspve.passwort_pruefen("richtig-richtig"))
@@ -258,7 +291,7 @@ class Weboberflaeche(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertIn("1 Probleme", text)
         self.assertNotIn("eventcrew", text)  # ohne Token keine Details
-        status, text, _ = self.anfrage("GET", "/health?token=test-token-123")
+        status, text, _ = self.anfrage("GET", "/health", kopf={"Authorization": "Bearer test-token-123"})
         self.assertIn("eventcrew-worker.service ist ausgefallen", text)
 
     def test_monitoring_mit_token(self):
@@ -270,11 +303,16 @@ class Weboberflaeche(unittest.TestCase):
         self.assertIn("ecspve_ok 0", text)
         for zeile in text.splitlines():
             self.assertRegex(zeile, r"^(# (HELP|TYPE) ecspve_\w+ .+|ecspve_\w+(\{[^}]*\})? -?[0-9.e+]+)$")
-        status, text, _ = self.anfrage("GET", "/api/status?token=test-token-123")
+        status, text, _ = self.anfrage("GET", "/api/status", kopf={"Authorization": "Bearer test-token-123"})
         daten = json.loads(text)
         self.assertFalse(daten["ok"])
         self.assertNotIn("schnittstellen", daten)  # Token nur für angemeldete Benutzer
+        self.assertNotIn("sicherheit", daten)
         self.assertEqual(self.anfrage("GET", "/metrics", kopf={"Authorization": "Bearer falsch"})[0], 401)
+        # Token in der Adresse nur, wenn ausdrücklich erlaubt
+        self.assertEqual(self.anfrage("GET", "/api/status?token=test-token-123")[0], 401)
+        konfig(TOKEN_IN_URL="ja")
+        self.assertEqual(self.anfrage("GET", "/api/status?token=test-token-123")[0], 200)
 
     def test_bedienung(self):
         cookie = self.anmelden()
@@ -322,9 +360,163 @@ class Weboberflaeche(unittest.TestCase):
         ip = "203.0.113.7"
         a = ecspve.Anmeldung()
         for _ in range(5):
-            self.assertFalse(a.gesperrt(ip))
+            self.assertIsNone(a.gesperrt(ip))
             a.fehlversuch(ip)
-        self.assertTrue(a.gesperrt(ip))
+        self.assertEqual(a.gesperrt(ip), "ip")
+        self.assertIsNone(a.gesperrt("203.0.113.8"))
+        for i in range(30):  # viele Adressen zusammen sperren alle
+            a.fehlversuch(f"198.51.100.{i}")
+        self.assertEqual(a.gesperrt("203.0.113.8"), "gesamt")
+
+    def test_totp_nach_rfc_6238(self):
+        geheim = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # „12345678901234567890“
+        for zeit, code in ((59, "287082"), (1111111109, "081804"), (1234567890, "005924"), (2000000000, "279037")):
+            self.assertEqual(ecspve.totp(geheim, zeit // 30), code)
+        self.assertEqual(ecspve.totp_schritt(geheim, "287082", jetzt=59 + 30), 1)  # 30 Sekunden Abweichung
+        self.assertIsNone(ecspve.totp_schritt(geheim, "287082", jetzt=59 + 90))
+
+    def test_erste_anmeldung_richtet_zweiten_faktor_ein(self):
+        ecspve.ZF_FILE.unlink()
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        self.assertEqual(json.loads(text)["schritt"], "einrichten")
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf=vorstufe)[0], 401)
+        status, text, _ = self.anfrage("POST", "/api/zwei-faktor/start", {}, vorstufe)
+        d = json.loads(text)
+        geheim = d["geheim"].replace(" ", "")
+        self.assertTrue(d["uri"].startswith("otpauth://totp/") and f"secret={geheim}" in d["uri"])
+        self.assertTrue(d["qr"].startswith("data:image/svg+xml;base64,"))
+        self.assertEqual(self.anfrage("POST", "/api/zwei-faktor/bestaetigen", {"code": "000000"}, vorstufe)[0], 403)
+        code = ecspve.totp(geheim, int(time.time() // 30))
+        status, text, kopf = self.anfrage("POST", "/api/zwei-faktor/bestaetigen", {"code": code}, vorstufe)
+        self.assertEqual(status, 200, text)
+        codes = json.loads(text)["notfallcodes"]
+        self.assertEqual(len(codes), 8)
+        self.assertRegex(codes[0], r"^[a-z2-9]{5}-[a-z2-9]{5}$")
+        cookie = kopf["Set-Cookie"].split(";")[0]
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 200)
+        self.assertNotIn(geheim, ecspve.SICHERHEIT_FILE.read_text())
+        self.assertEqual(oct(ecspve.ZF_FILE.stat().st_mode & 0o777), "0o600")
+        # Steht der zweite Faktor einmal, gibt es ohne Code kein neues Geheimnis mehr
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        self.assertEqual(json.loads(text)["schritt"], "code")
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        self.assertEqual(self.anfrage("POST", "/api/zwei-faktor/start", {}, vorstufe)[0], 403)
+
+    def test_code_nur_einmal_und_notfallcode(self):
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": "123"}, vorstufe)[0], 403)
+        code = self.naechster_code()
+        self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": code}, vorstufe)[0], 200)
+        # Derselbe Code ein zweites Mal (mitgelesen): abgelehnt
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": code}, vorstufe)[0], 403)
+        # Notfallcode (Schreibweise egal) – genau einmal
+        status, text, _ = self.anfrage("POST", "/api/anmelden/code", {"code": "ABCDE-23456"}, vorstufe)
+        self.assertEqual((status, json.loads(text)["notfall"], json.loads(text)["notfall_uebrig"]), (200, True, 0))
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": "abcde23456"}, vorstufe)[0], 403)
+
+    def test_sperre_nach_fehlversuchen(self):
+        for _ in range(5):
+            self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "falsch"}, {"X-ECSPVE": "1"})[0], 403)
+        status, text, _ = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        self.assertEqual(status, 429)  # auch mit richtigem Passwort
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Authorization": "Bearer test-token-123"})[0], 429)
+        self.assertEqual(self.anfrage("GET", "/ping")[0], 200)
+        self.assertEqual(self.anfrage("GET", "/")[0], 200)
+        texte = [e["text"] for e in ecspve.letzte_ereignisse(10)]
+        self.assertTrue(any("gesperrt" in t for t in texte), texte)
+
+    def test_falsche_codes_von_ueberall_sperren(self):
+        for i in range(10):
+            vom_proxy = {"X-ECSPVE": "1", "X-Forwarded-Proto": "https", "X-Forwarded-For": f"198.51.100.{i}"}
+            konfig(PROXY_IP="127.0.0.3")
+            status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, vom_proxy,
+                                              von="127.0.0.3")
+            vom_proxy["Cookie"] = kopf["Set-Cookie"].split(";")[0]
+            self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": "000000"}, vom_proxy,
+                                          von="127.0.0.3")[0], 403)
+        # Jetzt hilft auch der richtige Code nicht mehr – egal von welcher Adresse
+        status, text, _ = self.anfrage("POST", "/api/anmelden/code", {"code": self.naechster_code()}, vom_proxy,
+                                       von="127.0.0.3")
+        self.assertEqual(status, 429)
+        self.assertTrue(any("vermutlich bekannt" in e["text"] for e in ecspve.letzte_ereignisse(20)))
+
+    def test_sitzung_verraet_nichts(self):
+        self.assertEqual(json.loads(self.anfrage("GET", "/api/sitzung")[1]), {"stufe": None, "zwei_faktor": None})
+
+    def test_sitzung_endet_bei_neuem_passwort(self):
+        cookie = self.anmelden()
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 200)
+        time.sleep(0.01)
+        (ORDNER / "conf" / "passwort").write_text(ecspve.passwort_hash("richtig-richtig") + "\n")
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 401)
+
+    def test_zweiten_faktor_verwalten(self):
+        cookie = self.anmelden()
+        kopf = {"Cookie": cookie, "X-ECSPVE": "1"}
+        self.assertEqual(self.anfrage("POST", "/api/zwei-faktor/geraet", {"code": "000000"}, kopf)[0], 403)
+        status, text, _ = self.anfrage("POST", "/api/zwei-faktor/geraet", {"code": self.naechster_code()}, kopf)
+        self.assertEqual(json.loads(text)["geheim"].replace(" ", ""), GEHEIM)
+        status, text, _ = self.anfrage("POST", "/api/zwei-faktor/notfallcodes", {"code": self.naechster_code()}, kopf)
+        self.assertEqual(len(json.loads(text)["notfallcodes"]), 8)
+        st = json.loads(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[1])["sicherheit"]
+        self.assertEqual(st["notfall_uebrig"], 8)
+        self.assertIn("Neue Notfallcodes erzeugt – die alten gelten nicht mehr", [e["text"] for e in st["ereignisse"]])
+        # Neues Handy: danach gelten alle anderen Sitzungen nicht mehr
+        zweite = self.anmelden()
+        status, text, _ = self.anfrage("POST", "/api/zwei-faktor/start", {"code": self.naechster_code()}, kopf)
+        neu = json.loads(text)["geheim"].replace(" ", "")
+        status, text, antwort = self.anfrage("POST", "/api/zwei-faktor/bestaetigen",
+                                             {"code": ecspve.totp(neu, int(time.time() // 30))}, kopf)
+        self.assertEqual(status, 200, text)
+        self.assertEqual(ecspve.zf_laden()["geheim"], neu)
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": zweite})[0], 401)
+        neues_cookie = antwort["Set-Cookie"].split(";")[0]
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": neues_cookie})[0], 200)
+
+    def test_alle_anderen_abmelden(self):
+        erste, zweite = self.anmelden(), self.anmelden()
+        self.anfrage("POST", "/api/sitzungen/beenden", {}, {"Cookie": erste, "X-ECSPVE": "1"})
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": zweite})[0], 401)
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": erste})[0], 200)
+
+    def test_fremde_herkunft_und_kopfzeilen(self):
+        status, _, kopf = self.anfrage("GET", "/")
+        for name in ("Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertIn(name, kopf)
+        fremd = {"X-ECSPVE": "1", "Origin": "https://angreifer.example"}
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, fremd)[0], 403)
+        eigen = {"X-ECSPVE": "1", "Origin": f"http://127.0.0.1:{self.port}"}
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, eigen)[0], 200)
+
+    def test_nur_ueber_den_proxy(self):
+        konfig(PROXY_IP="127.0.0.3")
+        # Direkt (nicht vom Proxy, nicht lokal): nur /ping und /health
+        self.assertEqual(self.anfrage("GET", "/", von="127.0.0.2")[0], 403)
+        self.assertEqual(self.anfrage("GET", "/api/sitzung", von="127.0.0.2")[0], 403)
+        self.assertIn(self.anfrage("GET", "/health", von="127.0.0.2")[0], (200, 503))
+        # Vom Proxy, aber ohne HTTPS: keine Anmeldung
+        status, text, _ = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"},
+                                       {"X-ECSPVE": "1", "X-Forwarded-For": "192.0.2.10"}, von="127.0.0.3")
+        self.assertEqual(status, 403)
+        self.assertIn("HTTPS", json.loads(text)["fehler"])
+        # Vom Proxy mit HTTPS: Cookie mit Secure, HSTS, Sperre trifft die echte Besucher-IP
+        https = {"X-ECSPVE": "1", "X-Forwarded-Proto": "https", "X-Forwarded-For": "192.0.2.10"}
+        status, _, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, https, von="127.0.0.3")
+        self.assertEqual(status, 200)
+        self.assertIn("Secure", kopf["Set-Cookie"])
+        self.assertIn("Strict-Transport-Security", kopf)
+        for _ in range(5):
+            self.anfrage("POST", "/api/anmelden", {"passwort": "falsch"}, https, von="127.0.0.3")
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "x"}, https, von="127.0.0.3")[0], 429)
+        anderer = dict(https, **{"X-Forwarded-For": "192.0.2.11"})
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, anderer,
+                                      von="127.0.0.3")[0], 200)
 
 
 if __name__ == "__main__":

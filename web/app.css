@@ -214,7 +214,6 @@ details.menue .liste button:hover:not(:disabled) { background: var(--fein); }
 
 /* Anmeldung */
 .anmeldung { min-height: calc(100vh - 70px); display: grid; place-items: center; padding: 16px; }
-.anmeldung form { width: min(100%, 360px); display: grid; gap: .6rem; padding: 1.6rem; }
 .anmeldung h1 { font-size: 1.3rem; }
 .anmeldung label { font-size: .85rem; font-weight: 600; margin-top: .4rem; }
 .anmeldung input { font: inherit; padding: .55rem .7rem; border-radius: 8px; border: 1px solid var(--linie); background: var(--hg); color: var(--text); }
@@ -228,6 +227,29 @@ dialog::backdrop { background: rgba(10, 14, 20, .55); }
 .dialog-kopf h2 { margin: 0; overflow-wrap: anywhere; }
 #protokoll-status { padding: .6rem 1.1rem 0; font-size: .875rem; }
 #protokoll-text { margin: .6rem 1.1rem 1.1rem; padding: .8rem; background: var(--hg); border-radius: 8px; max-height: 60vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .78rem; line-height: 1.5; }
+
+/* Anmeldung in Schritten, zweiter Faktor */
+.anmelde-karte { width: min(100%, 440px); display: grid; gap: .6rem; padding: 1.6rem; }
+.anmelde-karte form, .anmelde-karte > div { display: grid; gap: .6rem; }
+.anmelde-karte h2 { margin: .4rem 0 0; }
+.anmelde-karte label { font-size: .85rem; font-weight: 600; margin-top: .4rem; }
+.anmelde-karte .haupt { padding: .55rem; font-size: .95rem; }
+ol.schritte { margin: 0; padding-left: 1.2rem; display: grid; gap: .3rem; font-size: .9rem; }
+.qr { display: grid; place-items: center; }
+.qr img { background: #fff; padding: 8px; border-radius: 10px; width: 220px; height: 220px; }
+code.schluessel { font-size: .9rem; letter-spacing: .04em; user-select: all; overflow-wrap: anywhere; }
+ul.codes { list-style: none; margin: 0; padding: .7rem; display: grid; grid-template-columns: repeat(2, 1fr); gap: .4rem 1rem;
+  background: var(--hg); border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .95rem; }
+.sicher-zeilen { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1rem; font-size: .875rem; margin: 0 0 .9rem; }
+.sicher-zeilen dt { color: var(--leise); }
+.sicher-zeilen dd { margin: 0; }
+h3.abstand { margin: 1.1rem 0 0; font-size: .9rem; }
+.ereignisse { list-style: none; margin: .5rem 0 0; padding: 0; font-size: .82rem; display: grid; }
+.ereignisse li { display: grid; grid-template-columns: 7.5rem 8.5rem 1fr; gap: .6rem; padding: .3rem 0; border-top: 1px solid var(--fein); }
+.ereignisse li.schlecht { font-weight: 400; }
+.ereignisse li.schlecht span:last-child { color: var(--fehler); }
+.ereignisse span { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .ereignisse li { grid-template-columns: 1fr; gap: 0; } }
 
 /* Formulare in Dialogen */
 input:not([type="checkbox"]):not([type="radio"]), select {

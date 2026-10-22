@@ -69,7 +69,7 @@
     const r = await fetch(pfad, { credentials: "same-origin", ...opt });
     let json = null;
     try { json = await r.json(); } catch (e) { /* keine JSON-Antwort */ }
-    if (r.status === 401 && pfad !== "/api/anmelden") {
+    if (r.status === 401 && !pfad.startsWith("/api/anmelden") && !pfad.startsWith("/api/zwei-faktor/")) {
       zeigeAnmeldung();
       throw new Error("Bitte anmelden.");
     }
@@ -108,13 +108,54 @@
     const laeuft = stand.auftraege.some((a) => a.status === "laeuft" || a.status === "wartet");
     timer = setTimeout(laden, laeuft ? 4000 : 10000);
   }
-  function zeigeAnmeldung() {
+  function anmeldeSchritt(name) {
+    for (const [id, schritt] of [["anmeldeform", "passwort"], ["codeform", "code"], ["einrichten", "einrichten"], ["notfall", "notfall"]]) {
+      $(id).hidden = schritt !== name;
+    }
+    $("anmeldefehler").textContent = "";
+    const fokus = { passwort: "passwort", code: "code", einrichten: "einrichten-code" }[name];
+    if (fokus) { $(fokus).value = ""; $(fokus).focus(); }
+  }
+  async function zeigeAnmeldung() {
     clearTimeout(timer);
+    for (const d of document.querySelectorAll("dialog[open]")) d.close();
     $("inhalt").hidden = true;
     $("gesamt").hidden = true;
     $("abmelden").hidden = true;
     $("anmeldung").hidden = false;
-    $("passwort").focus();
+    // Nach dem Neuladen im richtigen Schritt weitermachen
+    let s = { stufe: null };
+    try { s = await api("/api/sitzung"); } catch (e) { /* dann eben beim Passwort */ }
+    if (s.stufe === "passwort" && s.zwei_faktor) anmeldeSchritt("code");
+    else if (s.stufe === "passwort") einrichtenStarten();
+    else anmeldeSchritt("passwort");
+  }
+  function qrBlock(d) {
+    return [d.qr ? h("div", { class: "qr" }, h("img", { src: d.qr, alt: "QR-Code für die Authenticator-App", width: 220, height: 220 })) : null,
+      h("p", { class: "leise-text" }, d.qr ? "Kein Scannen möglich? Schlüssel von Hand eingeben: " : "Schlüssel in der App von Hand eingeben: ",
+        h("code", { class: "schluessel" }, d.geheim), " · ", h("a", { href: d.uri }, "auf diesem Handy direkt in der App öffnen"))];
+  }
+  async function einrichtenStarten() {
+    try {
+      const d = await api("/api/zwei-faktor/start", {});
+      anmeldeSchritt("einrichten");
+      $("einrichten-qr").hidden = !d.qr;
+      if (d.qr) $("einrichten-qr").src = d.qr;
+      $("einrichten-geheim").textContent = d.geheim;
+      $("einrichten-link").href = d.uri;
+    } catch (e) {
+      anmeldeSchritt("passwort");
+      $("anmeldefehler").textContent = e.message;
+    }
+  }
+  function notfallZeigen(codes) {
+    anmeldeSchritt("notfall");
+    $("notfall-liste").replaceChildren(...codes.map((c) => h("li", {}, c)));
+    $("notfall-kopieren").onclick = () => kopieren(codes.join("\n"));
+  }
+  async function kopieren(text) {
+    try { await navigator.clipboard.writeText(text); toast("Kopiert"); }
+    catch (e) { toast("Kopieren nicht möglich – bitte markieren und kopieren"); }
   }
   function zeigeInhalt() {
     $("anmeldung").hidden = true;
@@ -145,6 +186,7 @@
     auftragsListe();
     nachtKarte();
     schnittstellen();
+    sicherheitKarte();
   }
 
   function meldungen() {
@@ -154,10 +196,97 @@
       el.append(h("div", { class: "meldung fehler" },
         h("h3", {}, "Probleme"), h("ul", {}, stand.probleme.map((p) => h("li", {}, p.text)))));
     }
-    if (stand.hinweise.length) {
+    const hinweise = [...stand.hinweise];
+    const s = stand.sicherheit;
+    if (s && !s.nur_proxy) hinweise.push("Sicherheit: Die Seite ist nicht nur über den Reverse Proxy erreichbar – PROXY_IP setzen (Karte „Sicherheit“).");
+    if (s && s.zwei_faktor_seit && s.notfall_uebrig <= 2) hinweise.push(`Sicherheit: nur noch ${s.notfall_uebrig} Notfallcodes übrig – neue erzeugen.`);
+    if (hinweise.length) {
       el.append(h("div", { class: "meldung hinweis" },
-        h("h3", {}, "Hinweise"), h("ul", {}, stand.hinweise.map((t) => h("li", {}, t)))));
+        h("h3", {}, "Hinweise"), h("ul", {}, hinweise.map((t) => h("li", {}, t)))));
     }
+  }
+
+  function sicherheitKarte() {
+    const s = stand.sicherheit;
+    if (!s) return;
+    const datum = (ts) => new Date(ts * 1000).toLocaleString("de-DE", { dateStyle: "medium", timeStyle: "short" });
+    const zeile = (titel, ok, text) => [h("dt", {}, titel), h("dd", { class: ok ? "gut" : "mittel" }, `${ok ? "✔" : "⚠"} ${text}`)];
+    $("sicherheit").replaceChildren(
+      h("dl", { class: "sicher-zeilen" },
+        zeile("Zweiter Faktor", Boolean(s.zwei_faktor_seit), s.zwei_faktor_seit ? `eingerichtet seit ${datum(s.zwei_faktor_seit)}` : "nicht eingerichtet"),
+        zeile("Notfallcodes", s.notfall_uebrig > 2, `${s.notfall_uebrig} übrig`),
+        zeile("Zugang", s.nur_proxy, s.nur_proxy ? "nur über den Reverse Proxy"
+          : "auch direkt erreichbar – PROXY_IP in /etc/ecspve/ecspve.env auf die IP eures Caddy setzen"),
+        zeile("Verbindung", s.https, s.https ? "HTTPS" : "ohne HTTPS – bitte über die https-Adresse des Proxys öffnen"),
+        h("dt", {}, "Angemeldet"), h("dd", {}, `${s.sitzungen} ${s.sitzungen === 1 ? "Sitzung (diese)" : "Sitzungen"}`)),
+      h("div", { class: "werkzeuge" },
+        h("button", { type: "button", onclick: () => zfOeffnen("geraet") }, "Weiteres Handy hinzufügen"),
+        h("button", { type: "button", onclick: () => zfOeffnen("notfallcodes") }, "Neue Notfallcodes"),
+        h("button", { type: "button", onclick: () => zfOeffnen("neu") }, "Neues Handy einrichten"),
+        h("button", { type: "button", disabled: s.sitzungen < 2, onclick: andereAbmelden }, "Alle anderen abmelden")),
+      h("h3", { class: "abstand" }, "Letzte Ereignisse"),
+      s.ereignisse.length ? h("ul", { class: "ereignisse" }, s.ereignisse.map((e) =>
+        h("li", { class: e.ok ? "" : "schlecht" }, h("span", { class: "leise-text" }, zeit(e.zeit)),
+          h("span", { class: "mono" }, e.ip), h("span", {}, e.text)))) : h("p", { class: "leer" }, "Noch keine."));
+  }
+  async function andereAbmelden() {
+    if (!confirm("Alle anderen angemeldeten Browser abmelden?")) return;
+    try { await api("/api/sitzungen/beenden", {}); toast("Alle anderen Sitzungen sind abgemeldet"); laden(); }
+    catch (e) { toast(e.message); }
+  }
+
+  // --- Zweiter Faktor verwalten ----------------------------------------------------------------------
+  const ZF = {
+    geraet: ["Weiteres Handy hinzufügen", "Zeigt den QR-Code noch einmal, damit ein weiteres Handy dieselben Codes bekommt. Dafür einmal den aktuellen Code eingeben."],
+    notfallcodes: ["Neue Notfallcodes", "Erzeugt neue Notfallcodes – die bisherigen gelten danach nicht mehr."],
+    neu: ["Neues Handy einrichten", "Für ein neues Handy oder nach einem Verlust: Danach gilt nur noch die neu eingerichtete App, alle anderen Handys und Sitzungen werden abgemeldet. Zum Bestätigen den aktuellen Code oder einen Notfallcode eingeben."],
+  };
+  let zfArt = null;
+  let zfPhase = "code";
+  function zfOeffnen(art) {
+    zfArt = art;
+    zfPhase = "code";
+    const f = $("zf-form");
+    $("zf-titel").textContent = ZF[art][0];
+    $("zf-text").textContent = ZF[art][1];
+    $("zf-label").firstChild.textContent = "Aktueller Code aus der App (oder ein Notfallcode) ";
+    $("zf-eingabe").hidden = false;
+    $("zf-knopf").hidden = false;
+    $("zf-ergebnis").replaceChildren();
+    $("zf-fehler").textContent = "";
+    f.elements.code.value = "";
+    $("zf-dialog").showModal();
+    f.elements.code.focus();
+  }
+  async function zfAbschicken(ev) {
+    ev.preventDefault();
+    const f = $("zf-form");
+    const code = f.elements.code.value.trim();
+    const fertig = (inhalt) => { $("zf-eingabe").hidden = true; $("zf-knopf").hidden = true; $("zf-ergebnis").replaceChildren(...inhalt); };
+    const codeListe = (codes) => [h("p", {}, "Jetzt ausdrucken oder im Passwort-Manager speichern – sie werden nicht noch einmal angezeigt:"),
+      h("ul", { class: "codes" }, codes.map((c) => h("li", {}, c))),
+      h("button", { type: "button", onclick: () => kopieren(codes.join("\n")) }, "Kopieren")];
+    $("zf-fehler").textContent = "";
+    try {
+      if (zfArt === "geraet") {
+        fertig(qrBlock(await api("/api/zwei-faktor/geraet", { code })));
+      } else if (zfArt === "notfallcodes") {
+        fertig(codeListe((await api("/api/zwei-faktor/notfallcodes", { code })).notfallcodes));
+        laden();
+      } else if (zfPhase === "code") {
+        $("zf-ergebnis").replaceChildren(...qrBlock(await api("/api/zwei-faktor/start", { code })));
+        $("zf-label").firstChild.textContent = "Code aus der NEUEN App ";
+        $("zf-text").textContent = "Mit dem neuen Handy diesen QR-Code scannen und den Code daraus eingeben.";
+        f.elements.code.value = "";
+        f.elements.code.focus();
+        zfPhase = "bestaetigen";
+      } else {
+        const d = await api("/api/zwei-faktor/bestaetigen", { code });
+        $("zf-text").textContent = "Fertig – ab jetzt gilt nur noch die neue App.";
+        fertig(codeListe(d.notfallcodes));
+        laden();
+      }
+    } catch (e) { $("zf-fehler").textContent = e.message; f.elements.code.select(); }
   }
 
   function messwert(name, anteil, text) {
@@ -373,12 +502,8 @@
   }
 
   function kopierZeile(titel, wert, anzeige, text) {
-    const kopieren = async () => {
-      try { await navigator.clipboard.writeText(wert); toast("Kopiert"); }
-      catch (e) { toast("Kopieren nicht möglich – bitte markieren und kopieren"); }
-    };
     return h("div", { class: "schnitt-zeile" }, h("strong", {}, titel), h("code", {}, anzeige),
-      h("button", { type: "button", onclick: kopieren }, "Kopieren"), h("p", {}, text));
+      h("button", { type: "button", onclick: () => kopieren(wert) }, "Kopieren"), h("p", {}, text));
   }
 
   function schnittstellen() {
@@ -390,10 +515,12 @@
     $("schnittstellen").replaceChildren(h("div", { class: "schnitt" },
       kopierZeile("Funktionsprüfung", `${basis}/health`, `${basis}/health`,
         "Antwortet 200 „OK“ oder 503 „FEHLER“ – ohne Anmeldung. Für Uptime Kuma (HTTP-Monitor), Checkmk, Zabbix, Nagios oder jede einfache HTTP-Prüfung."),
-      kopierZeile("Status als JSON", `${basis}/api/status?token=${token}`, `${basis}/api/status?token=${verdeckt}`,
-        "Alle Werte dieser Seite. Uptime Kuma: „HTTP(s) – Json Query“ mit dem Ausdruck ok und dem erwarteten Wert true; auch für Home Assistant oder eigene Skripte."),
+      kopierZeile("Status als JSON", `${basis}/api/status`, `${basis}/api/status`,
+        "Alle Werte dieser Seite – mit dem Token als Header (unten). Uptime Kuma: „HTTP(s) – Json Query“, Ausdruck ok, erwarteter Wert true, unter Headers die Zeile darunter."),
+      kopierZeile("Header", `{"Authorization": "Bearer ${token}"}`, `{"Authorization": "Bearer ${verdeckt}"}`,
+        "So geht das Token mit – als Header statt in der Adresse, damit es nicht in Protokollen landet."),
       kopierZeile("Prometheus", `${basis}/metrics`, `${basis}/metrics`,
-        "Metriken für Prometheus, Grafana Agent/Alloy, VictoriaMetrics oder Netdata – mit dem Token als Bearer (authorization: credentials) oder ?token=…."),
+        "Metriken für Prometheus, Grafana Alloy, VictoriaMetrics oder Netdata – Token als Bearer (authorization: credentials)."),
       kopierZeile("Token", token, verdeckt, "Neu erzeugen im Container der Übersicht: ecspve token --neu"),
       h("div", {}, knopf)));
   }
@@ -559,11 +686,38 @@
       ev.preventDefault();
       $("anmeldefehler").textContent = "";
       try {
-        await api("/api/anmelden", { passwort: $("passwort").value });
+        const d = await api("/api/anmelden", { passwort: $("passwort").value });
         $("passwort").value = "";
-        laden();
-      } catch (e) { $("anmeldefehler").textContent = e.message; }
+        if (d.schritt === "einrichten") einrichtenStarten();
+        else anmeldeSchritt("code");
+      } catch (e) { $("anmeldefehler").textContent = e.message; $("passwort").select(); }
     });
+    $("codeform").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      $("anmeldefehler").textContent = "";
+      try {
+        const d = await api("/api/anmelden/code", { code: $("code").value });
+        if (d.notfall) toast(`Mit Notfallcode angemeldet – noch ${d.notfall_uebrig} übrig`);
+        laden();
+      } catch (e) {
+        $("anmeldefehler").textContent = e.message;
+        $("code").select();
+        if (/Passwort/.test(e.message)) anmeldeSchritt("passwort");
+      }
+    });
+    $("einrichtenform").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      $("anmeldefehler").textContent = "";
+      try {
+        notfallZeigen((await api("/api/zwei-faktor/bestaetigen", { code: $("einrichten-code").value })).notfallcodes);
+      } catch (e) { $("anmeldefehler").textContent = e.message; $("einrichten-code").select(); }
+    });
+    $("notfall-weiter").addEventListener("click", laden);
+    document.querySelector("[data-neu-anmelden]").addEventListener("click", async () => {
+      try { await api("/api/abmelden", {}); } catch (e) { /* egal */ }
+      anmeldeSchritt("passwort");
+    });
+    $("zf-form").addEventListener("submit", zfAbschicken);
     $("abmelden").addEventListener("click", async () => {
       try { await api("/api/abmelden", {}); } catch (e) { /* egal */ }
       zeigeAnmeldung();

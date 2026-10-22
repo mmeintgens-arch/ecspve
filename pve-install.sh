@@ -147,14 +147,14 @@ if (( ! UPDATE )); then
 
   # Passwort der Weboberfläche: angegeben, abgefragt oder zufällig
   if [ -z "$PASSWORD" ] && [ -t 0 ]; then
-    read -rsp "Passwort für die Übersicht (mind. 10 Zeichen, leer = zufällig): " PASSWORD; echo
+    read -rsp "Passwort für die Übersicht (mind. 12 Zeichen, leer = zufällig): " PASSWORD; echo
     if [ -n "$PASSWORD" ]; then
       read -rsp "Passwort wiederholen: " REPEAT; echo
       [ "$PASSWORD" = "$REPEAT" ] || die "Die Passwörter stimmen nicht überein."
     fi
   fi
   [ -n "$PASSWORD" ] || PASSWORD=$(tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 20 || true)
-  [ "${#PASSWORD}" -ge 10 ] || die "Das Passwort muss mindestens 10 Zeichen lang sein."
+  [ "${#PASSWORD}" -ge 12 ] || die "Das Passwort muss mindestens 12 Zeichen lang sein."
 
   say "Debian-Vorlage suchen"
   pveam update >/dev/null 2>&1 || true
@@ -249,6 +249,9 @@ CT_ADDR=${CT_IP:-$(pct_exec hostname -I | awk '{print $1}')}
 say "Fertig – Container $CTID"
 echo "  Weboberfläche: http://$CT_ADDR:$PORT_CT  (nur HTTP – im Caddy davor: reverse_proxy $CT_ADDR:$PORT_CT)"
 (( UPDATE )) || echo "  Passwort:      /root/ecspve-ct$CTID-passwort.txt (nur für root lesbar)"
+(( UPDATE )) || echo "  Erste Anmeldung: Passwort, dann zweiten Faktor mit einer Authenticator-App einrichten."
+pct_exec grep -q '^PROXY_IP=.' /etc/ecspve/ecspve.env ||
+  warn "Kein --proxy-ip gesetzt: Die Übersicht ist auch direkt über HTTP erreichbar. Empfohlen: $SRC/pve-install.sh --proxy-ip=<IP eures Caddy> – dann nur noch über den Proxy mit HTTPS."
 [ -n "$CT_IP" ] || warn "Der Container hat DHCP – der SSH-Schlüssel gilt deshalb von jeder Adresse. Mit fester IP (--ip=… beim Anlegen) ist er zusätzlich auf diese Adresse beschränkt."
 echo "  Update:        $SRC/pve-install.sh --pull"
 echo "  Konsole:       pct enter $CTID"

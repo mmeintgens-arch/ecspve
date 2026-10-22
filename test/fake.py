@@ -18,6 +18,7 @@ from pathlib import Path
 
 PROJEKT = Path(__file__).resolve().parents[1]
 HELFER = PROJEKT / "deploy" / "proxmox" / "ecspve-helfer"
+DEMO_GEHEIM = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 
 def einheit(name, aktiv="active", sub="running", typ="simple", datei="enabled"):
@@ -169,11 +170,33 @@ def befehl(name, args, ordner):
     if name == "git":
         print("Already up to date.")
         return 0
+    if name == "qrencode":
+        print(qr_attrappe(args[-1]))
+        return 0
     if name in ("pve-install.sh", "turnierapp-update-lxc", "create-lxc.sh"):
         print(f"(Attrappe) {name} {' '.join(args)}\n==> Fertig")
         return 0
     print(f"(Attrappe) unbekannter Befehl {name}", file=sys.stderr)
     return 1
+
+
+def qr_attrappe(text):
+    """Sieht aus wie ein QR-Code (für Vorschau und Tests), lässt sich aber nicht scannen."""
+    import hashlib
+    n, bits = 29, int(hashlib.sha256(text.encode()).hexdigest() * 4, 16)
+    felder = []
+    for y in range(n):
+        for x in range(n):
+            ecke = next(((ex, ey) for ex, ey in ((0, 0), (n - 7, 0), (0, n - 7)) if ex <= x < ex + 7 and ey <= y < ey + 7), None)
+            if ecke:
+                dx, dy = x - ecke[0], y - ecke[1]
+                an = dx in (0, 6) or dy in (0, 6) or (2 <= dx <= 4 and 2 <= dy <= 4)
+            else:
+                an = (bits >> ((y * n + x) % 1000)) & 1
+            if an:
+                felder.append(f'<rect x="{x + 2}" y="{y + 2}" width="1" height="1"/>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n + 4} {n + 4}"><rect width="100%" height="100%" '
+            f'fill="#fff"/><g fill="#000">{"".join(felder)}</g></svg>')
 
 
 def pct(name, args, ordner):
@@ -291,7 +314,7 @@ def anlegen(ordner):
                        f"import fake\nfrom pathlib import Path\n"
                        f"sys.exit(fake.befehl(os.path.basename(sys.argv[0]), sys.argv[1:], Path({str(ordner)!r})))\n")
     starter.chmod(0o755)
-    for n in ("pct", "pvesh", "qm", "pveam", "pveversion", "systemctl", "apt-get", "git", "pve-install.sh",
+    for n in ("pct", "pvesh", "qm", "pveam", "pveversion", "systemctl", "apt-get", "git", "qrencode", "pve-install.sh",
               "turnierapp-update-lxc", "create-lxc.sh"):
         (ordner / "bin" / n).symlink_to(starter)
     for n in ("systemctl", "apt-get", "hostname", "curl", "python3", "ecspve"):
@@ -338,6 +361,11 @@ if __name__ == "__main__":
         sys.path.insert(0, str(PROJEKT))
         import ecspve
         (ziel / "conf" / "passwort").write_text(ecspve.passwort_hash("demo-passwort") + "\n")
+        if "--erstanmeldung" not in sys.argv:
+            # Zweiter Faktor mit festem Schlüssel – Code z. B.: python3 -c "import ecspve,time; print(ecspve.totp(…))"
+            ecspve.zf_speichern({"geheim": DEMO_GEHEIM, "seit": time.time() - 86400 * 3, "letzter_schritt": 0,
+                                 "notfall": [ecspve.notfall_hash(c) for c in ("demo2demo2", "demo3demo3", "demo4demo4")]})
+            print(f"Demo: Passwort demo-passwort, Schlüssel für die Authenticator-App {DEMO_GEHEIM}", flush=True)
         ecspve.serve()
     else:
         for k, v in env.items():

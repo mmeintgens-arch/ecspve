@@ -143,9 +143,17 @@ status.eventcrew-steinfurt.de {
 }
 ```
 
-Oder ohne Domain nur intern (`tls internal`). Dann `https://status…` öffnen und mit dem Passwort anmelden.
+Oder ohne Domain nur intern (`tls internal`). Ist `--proxy-ip` gesetzt, geht die Seite **nur** über diesen Caddy
+(direkt auf Port 8080 antworten nur noch `/health` und `/ping`), und die Anmeldung nur über HTTPS.
 
-**4. Automatische Updates auswählen.** In jeder Karte bei „Nachts automatisch“ die Häkchen setzen: **System**
+**4. Erste Anmeldung mit zweitem Faktor.** `https://status…` öffnen, Passwort eingeben. Beim ersten Mal richtet die
+Seite den zweiten Faktor ein: QR-Code mit einer Authenticator-App scannen (Microsoft Authenticator, Google
+Authenticator, Aegis, 2FAS …), Code eintragen, die acht **Notfallcodes** sichern. Mehrere Leute im Team scannen
+denselben QR-Code – später geht das unter **Sicherheit → Weiteres Handy hinzufügen**.
+
+<img src="docs/zwei-faktor.png" alt="Zweiten Faktor einrichten" width="520">
+
+**5. Automatische Updates auswählen.** In jeder Karte bei „Nachts automatisch“ die Häkchen setzen: **System**
 (Debian-Pakete im Container) und/oder **App** (der Update-Weg der App aus der Tabelle oben).
 
 ## Automatische Updates
@@ -181,7 +189,7 @@ Neustart löst ihr zu einer ruhigen Zeit in der Proxmox-Oberfläche aus.
 
 ## Monitoring anbinden
 
-Unten auf der Seite stehen die fertigen Adressen zum Kopieren (inklusive Token).
+Unten auf der Seite stehen die fertigen Adressen und der Header mit dem Token zum Kopieren.
 
 | Schnittstelle | Antwort | Anmeldung |
 |---|---|---|
@@ -190,14 +198,15 @@ Unten auf der Seite stehen die fertigen Adressen zum Kopieren (inklusive Token).
 | `GET /metrics` | Prometheus-Format, z. B. `ecspve_ok`, `ecspve_gast_laeuft`, `ecspve_dienst_ok`, `ecspve_pruefung_ok`, `ecspve_gast_updates`, `ecspve_host_neustart_noetig` | Token |
 | `GET /ping` | `ok` – nur „läuft die Übersicht selbst?“ | keine |
 
-Das Token geht als `Authorization: Bearer <Token>` oder als `?token=<Token>`. Neu erzeugen im Container:
-`ecspve token --neu`.
+Das Token geht als Header `Authorization: Bearer <Token>` mit. Als `?token=<Token>` in der Adresse nur mit
+`TOKEN_IN_URL=ja` – dort landet es in den Protokollen von Proxy und Monitoring. Ein falsches Token zählt als
+Fehlversuch (Sperre wie bei der Anmeldung). Neu erzeugen im Container: `ecspve token --neu`.
 
 **Uptime Kuma**
 
 - einfach: Monitor „HTTP(s)“ auf `https://status…/health` – rot, sobald irgendetwas gestört ist.
-- genauer: Monitor „HTTP(s) – Json Query“ auf `https://status…/api/status?token=…`, Ausdruck `ok`, erwarteter Wert
-  `true`.
+- genauer: Monitor „HTTP(s) – Json Query“ auf `https://status…/api/status`, Ausdruck `ok`, erwarteter Wert `true`,
+  unter **Headers** `{"Authorization": "Bearer <Token>"}`.
 - umgekehrt (Push, falls Kuma die Übersicht nicht erreicht): Monitor „Push“ anlegen und dessen Adresse als
   `HEARTBEAT_URL=https://kuma…/api/push/AbCd?status={status}&msg={msg}` eintragen.
 
@@ -231,7 +240,9 @@ Ordnung“ und das Ergebnis jedes Nachtlaufs.
 | `PVE_HOST` | IP des Hosts | Proxmox-Host mit dem Helfer (trägt `pve-install.sh` ein) |
 | `PVE_URL` | `https://PVE_HOST:8006` | Adresse der Proxmox-Oberfläche für die Links |
 | `ADRESSE`, `PORT` | `0.0.0.0`, `8080` | Webserver (nur HTTP) |
-| `PROXY_IP` | – | IP(s) eures Reverse Proxys, für die echte Besucher-IP |
+| `PROXY_IP` | – | IP(s) eures Reverse Proxys. **Dringend empfohlen:** dann nur über den Proxy erreichbar, Anmeldung nur mit HTTPS, Sperren treffen die echte Besucher-IP |
+| `TOKEN_IN_URL` | `nein` | Monitoring-Token auch als `?token=` in der Adresse annehmen |
+| `MELDUNG_ANMELDUNG` | `ja` | bei jeder erfolgreichen Anmeldung eine Nachricht an `MELDUNG_URL` (Sperren und neue Authenticator-Apps immer) |
 | `TOKEN` | zufällig | für `/api/status` und `/metrics` |
 | `SNAPSHOTS_BEHALTEN` | `2` | Snapshot vor jedem Update, so viele bleiben (0 = keiner) |
 | `NEUSTART_NACH_UPDATE` | `nein` | Container neu starten, wenn ein Update es verlangt |
@@ -258,7 +269,9 @@ Im Container der Übersicht:
 ```bash
 ecspve status          # dasselbe wie die Seite, als Liste
 ecspve verbindung      # erreicht der Container den Helfer auf dem Host?
-ecspve passwort        # Passwort der Weboberfläche neu setzen
+ecspve passwort        # Passwort der Weboberfläche neu setzen (meldet alle ab)
+ecspve zwei-faktor     # Stand des zweiten Faktors
+ecspve zwei-faktor zuruecksetzen   # Handy weg und keine Notfallcodes mehr: neue App bei der nächsten Anmeldung
 ecspve token --neu     # neues Token für Monitoring
 journalctl -u ecspve -f
 ```
@@ -282,13 +295,51 @@ Passwort, Token und Auswahl bleiben. Mit dem Häkchen **App** in der Karte der �
 
 ## Sicherheit
 
-- Die Weboberfläche kann Container anlegen, neu starten und Updates anstoßen – nur hinter eurem Caddy mit HTTPS betreiben,
-  am besten nur aus dem Vereinsnetz bzw. per VPN erreichbar.
-- Anmeldung mit Passwort (PBKDF2), Sitzung 12 Stunden, nach 5 Fehlversuchen 15 Minuten Sperre je IP.
-  Aktionen brauchen einen eigenen Header (Schutz vor fremden Formularen), Cookies sind `HttpOnly` und
-  `SameSite=Strict`, hinter HTTPS auch `Secure`.
-- Was der Container auf dem Host darf, steht vollständig in `deploy/proxmox/ecspve-helfer` – nichts darüber hinaus.
-  Freigabe zurücknehmen: die Zeile mit `ecspve-ct<ID>` aus `/root/.ssh/authorized_keys` löschen.
+Die Seite kann Container anlegen, neu starten und Updates anstoßen. Deshalb ist sie mehrfach abgesichert:
+
+**Anmeldung mit zweitem Faktor**
+- Passwort (mindestens 12 Zeichen, PBKDF2 mit 600 000 Runden) **und** ein Code aus einer Authenticator-App (TOTP nach
+  RFC 6238, 6 Ziffern, 30 Sekunden). Ohne Code gibt es keine Daten und keine Aktionen.
+- Jeder Code gilt bei der Anmeldung nur **einmal** – wer ihn mitliest, kann ihn nicht wiederverwenden.
+- Acht **Notfallcodes** für den Fall, dass das Handy weg ist – jeder nur einmal, gespeichert nur als Hash. Neue unter
+  **Sicherheit → Neue Notfallcodes**. Ist alles weg: im Container `ecspve zwei-faktor zuruecksetzen`.
+- **Neues Handy einrichten** (nach Verlust) meldet alle anderen Handys und Sitzungen ab. Ein neues Passwort
+  (`ecspve passwort`) ebenso.
+- Das Geheimnis der App liegt nur im Container (`/var/lib/ecspve/zwei-faktor.json`, nur für den Dienst lesbar).
+- Bis zur ersten Anmeldung ist der zweite Faktor noch nicht eingerichtet – wer bis dahin das Passwort kennt, könnte
+  seine eigene App eintragen. Deshalb gleich nach der Installation anmelden und einrichten.
+
+**Gegen Durchprobieren**
+- 5 Fehlversuche (Passwort, Code oder Monitoring-Token) von einer Adresse: diese Adresse 15 Minuten gesperrt.
+  30 Fehlversuche von verschiedenen Adressen: Anmeldung für alle 15 Minuten gesperrt. Jeder Fehlversuch kostet
+  zusätzlich eine Sekunde.
+- 10 falsche Codes nach **richtigem** Passwort innerhalb einer Stunde (egal von wo): Dann kennt offenbar jemand das
+  Passwort – die Anmeldung ist für eine Stunde gesperrt, und es kommt die Aufforderung, es zu ändern
+  (`ecspve passwort`).
+- Jede Sperre geht als Benachrichtigung an `MELDUNG_URL`, auf Wunsch auch jede erfolgreiche Anmeldung.
+
+**Sitzungen**
+- Nach 30 Minuten ohne Seite offen oder spätestens nach 12 Stunden neu anmelden. Nach dem zweiten Faktor gibt es ein
+  neues Sitzungs-Token. Nur im Speicher – ein Neustart des Dienstes meldet alle ab.
+- **Alle anderen abmelden** unter **Sicherheit**, z. B. wenn ein Rechner verloren ging.
+- Cookies sind `HttpOnly`, `SameSite=Strict` und hinter HTTPS `Secure`.
+
+**Zugang und Browser**
+- Mit `PROXY_IP`: nur über euren Caddy erreichbar, Anmeldung nur über HTTPS. Ohne `PROXY_IP` warnt die Seite.
+  Zusätzlich sinnvoll: im Caddy nur das Vereinsnetz oder VPN zulassen (Beispiel oben).
+- Aktionen brauchen einen eigenen Header und eine passende Herkunft (`Origin`) – ein fremdes Formular oder eine fremde
+  Seite kann nichts auslösen.
+- Strenge Content-Security-Policy (nur eigene Skripte, keine eingebetteten), kein Einbetten in fremde Seiten,
+  `nosniff`, HSTS hinter HTTPS. Langsame oder hängende Verbindungen werden nach 30 Sekunden getrennt.
+
+**Nachvollziehbar**
+- Unter **Sicherheit → Letzte Ereignisse** und in `/var/lib/ecspve/sicherheit.jsonl`: Anmeldungen, Fehlversuche,
+  Sperren, Änderungen am zweiten Faktor und jede Aktion (Neustart, Update, Container anlegen …) – mit IP.
+  Auch im Journal: `journalctl -u ecspve | grep Sicherheit`.
+
+**Host**
+- Was der Container auf dem Host darf, steht vollständig in `deploy/proxmox/ecspve-helfer` – nichts darüber hinaus,
+  keine Shell. Freigabe zurücknehmen: die Zeile mit `ecspve-ct<ID>` aus `/root/.ssh/authorized_keys` löschen.
 - Das Monitoring-Token erlaubt nur Lesen.
 
 ## Entwicklung und Tests
