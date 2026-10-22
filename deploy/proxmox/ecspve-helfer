@@ -12,6 +12,11 @@ steht: Container-IDs und Dienstnamen werden geprüft, freie Befehle gibt es nich
   ecspve-helfer dienst ID NAME.service         einen Dienst im Container neu starten
   ecspve-helfer host-update                    Proxmox-Host aktualisieren (apt-get dist-upgrade)
   ecspve-helfer auffrischen                    Paketlisten in allen laufenden Containern neu laden
+  ecspve-helfer anlegen-optionen               Speicher, Netzwerk-Brücken, nächste freie ID (JSON)
+  ecspve-helfer anlegen NAME [--cores=N] [--memory=MB] [--disk=GB] [--storage=NAME] [--bridge=NAME]
+                [--vlan=N] [--ip=dhcp|CIDR] [--gw=IP] [--ctid=N] [--onboot=0|1] [--start=0|1]
+                                               neuen Debian-Container anlegen (unprivilegiert)
+  ecspve-helfer pruefung ID ADRESSE|--aus      eigene Funktionsprüfung eines Containers festlegen
   ecspve-helfer auftrag AUFTRAG                Stand und Protokoll eines Auftrags (JSON)
   ecspve-helfer version
 
@@ -20,6 +25,7 @@ Protokolle: /var/lib/ecspve-helfer/auftraege. Einstellungen (optional): /etc/ecs
 """
 
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -30,6 +36,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -44,11 +51,14 @@ BOOT = Path(os.environ.get("ECSPVE_BOOT_DIR", "/boot"))
 KNOTEN = os.environ.get("ECSPVE_KNOTEN") or socket.gethostname().split(".")[0]
 WURZEL = os.environ.get("ECSPVE_WURZEL", "")  # Tests: Werkzeuge der Apps liegen unter diesem Ordner
 AUFTRAEGE = STAND / "auftraege"
+PRUEFUNGEN = STAND / "pruefungen.json"
 SPERREN = STAND / "sperren"
 PFAD = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 AUFTRAG_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,120}\.service$")
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+VORLAGE_RE = re.compile(r"^debian-1[2-9]-standard_.*_amd64\.tar\.(zst|gz|xz)$")
 STROM = {"start": "Starten", "herunterfahren": "Herunterfahren", "neustart": "Neustart", "stopp": "Ausschalten"}
 UPDATE_WAS = {"alles": "System und App", "system": "Betriebssystem", "app": "App"}
 
@@ -146,7 +156,8 @@ def ausgabe(daten, code=0):
 
 def ausfuehren(args, timeout=60):
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        p = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", "Zeitüberschreitung"
@@ -176,8 +187,9 @@ def ja(wert):
     return str(wert).strip().lower() in ("ja", "1", "true", "yes", "an", "on")
 
 
-def pvesh(pfad):
-    rc, out, err = ausfuehren(["pvesh", "get", pfad, "--output-format", "json"], timeout=60)
+def pvesh(pfad, **param):
+    rc, out, err = ausfuehren(["pvesh", "get", pfad, "--output-format", "json",
+                               *[t for k, v in param.items() for t in (f"--{k}", str(v))]], timeout=60)
     if rc != 0:
         raise Fehler(f"pvesh {pfad}: {(err.strip().splitlines() or [rc])[-1]}")
     return json.loads(out or "null")
@@ -244,6 +256,20 @@ def gueltige_id(text):
     return int(text)
 
 
+def lies_json(pfad, vorgabe):
+    try:
+        return json.loads(pfad.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return vorgabe
+
+
+def schreibe_json(pfad, daten):
+    pfad.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = pfad.with_suffix(".tmp")
+    tmp.write_text(json.dumps(daten, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(pfad)
+
+
 # --- Übersicht ---------------------------------------------------------------------------------------
 
 def host_details():
@@ -273,6 +299,7 @@ def fehlgeschlagene_einheiten():
 
 def uebersicht():
     gaeste, host = [], {"name": KNOTEN}
+    eigene = eigene_pruefungen(lade_konf())
     for r in pvesh("/cluster/resources"):
         typ = r.get("type")
         if typ == "node" and r.get("node") == KNOTEN:
@@ -287,6 +314,7 @@ def uebersicht():
                 "maxmem": r.get("maxmem") or 0, "disk": r.get("disk") or 0, "maxdisk": r.get("maxdisk") or 0,
                 "uptime": r.get("uptime") or 0, "tags": [t for t in re.split(r"[;, ]+", r.get("tags") or "") if t],
                 "onboot": conf["onboot"], "snapshots": [s for s in conf["snapshots"] if s.startswith("ecspve_")],
+                "pruefung_eigen": eigene.get(str(gid)),
             })
     gaeste.sort(key=lambda g: g["id"])
     host.update(zwischenspeicher("host", 600, host_details))
@@ -297,9 +325,32 @@ def uebersicht():
 
 # --- Prüfung der Container ---------------------------------------------------------------------------
 
+def eigene_pruefungen(konf):
+    """Eigene Funktionsprüfungen je Container – aus der Oberfläche, helfer.conf hat Vorrang."""
+    erg = {gid: {"wert": wert, "quelle": "oberflaeche"} for gid, wert in gespeicherte_pruefungen().items()}
+    for k, v in konf.items():
+        m = re.fullmatch(r"PRUEFUNG_([0-9]+)", k)
+        if m and v.strip():
+            erg[m.group(1)] = {"wert": v.strip(), "quelle": "helfer.conf"}
+    return erg
+
+
+def gespeicherte_pruefungen():
+    daten = lies_json(PRUEFUNGEN, {})
+    return daten if isinstance(daten, dict) else {}
+
+
+def pruef_adresse(text):
+    teile = urllib.parse.urlsplit(text)
+    if (len(text) > 300 or teile.scheme not in ("http", "https") or not teile.hostname
+            or not re.fullmatch(r"[\x21-\x7e]+", text)):
+        raise Fehler("Bitte eine Adresse wie http://127.0.0.1:8080/ angeben (http oder https, ohne Leerzeichen).")
+    return text
+
+
 def probe_skript(gid, konf):
     zeilen = [PROBE]
-    eigen = konf.get(f"PRUEFUNG_{gid}", "").strip()
+    eigen = (eigene_pruefungen(konf).get(str(gid)) or {}).get("wert", "")
     for app in APPS:
         aufruf = ""
         if not eigen:
@@ -462,9 +513,11 @@ def auftraege_liste(anzahl):
     liste = []
     for jid in namen[:anzahl]:
         try:
-            liste.append(lies(jid))
+            job = lies(jid)
         except Fehler:
-            pass
+            continue
+        job.pop("geheim", None)  # z. B. das Root-Passwort eines neuen Containers – nur im einzelnen Auftrag
+        liste.append(job)
     return liste
 
 
@@ -561,15 +614,20 @@ def lauf(jid):
     gid = job["gast"]
     sperren = []
     try:
-        if job["art"] in ("update", "host-update"):
-            # Updates nacheinander, nie mehrere gleichzeitig (Last, Paketquellen, Snapshots)
+        if job["art"] in ("update", "host-update", "anlegen"):
+            # Updates und neue Container nacheinander, nie gleichzeitig (Last, Paketquellen, Snapshots)
             sperren.append(Sperre("updates"))
             if not sperren[-1].nehmen(warten=False):
-                log.zeile("Warte, bis das vorige Update fertig ist …")
+                log.zeile("Warte, bis der vorige Auftrag fertig ist …")
                 sperren[-1].nehmen()
-        sperren.append(Sperre(f"gast-{gid}" if gid is not None else job["art"]))
-        if not sperren[-1].nehmen(warten=False):
-            raise Fehler("Für diesen Gast läuft schon ein Auftrag.")
+        if gid is not None:
+            sperren.append(Sperre(f"gast-{gid}"))
+            if not sperren[-1].nehmen(warten=False):
+                raise Fehler("Für diesen Gast läuft schon ein Auftrag.")
+        else:
+            # Aufträge ohne festen Gast (anlegen, auffrischen …) warten auf den vorigen gleicher Art
+            sperren.append(Sperre(job["art"]))
+            sperren[-1].nehmen()
         job.update(status="laeuft", start=time.time())
         schreibe(job)
         log.abschnitt(job["titel"])
@@ -671,9 +729,7 @@ def a_update(job, log):
 
 def job_hinweise(job, hinweise):
     if hinweise:
-        aktuell = lies(job["id"])
-        aktuell["hinweise"] = hinweise
-        schreibe(aktuell)
+        job_felder(job, hinweise=hinweise)
 
 
 def a_dienst(job, log):
@@ -707,8 +763,173 @@ def a_auffrischen(job, log):
     return ("warnung", f"Nicht möglich in: {', '.join(fehler)}") if fehler else ("ok", "Paketlisten aktuell")
 
 
+def bruecken():
+    return sorted(n["iface"] for n in pvesh(f"/nodes/{KNOTEN}/network", type="any_bridge") or [] if n.get("iface"))
+
+
+def speicher(inhalt):
+    return [{"name": s["storage"], "typ": s.get("type", ""), "frei": s.get("avail"), "gesamt": s.get("total")}
+            for s in pvesh(f"/nodes/{KNOTEN}/storage", content=inhalt, enabled=1) or [] if s.get("active")]
+
+
+def belegt():
+    return {(int(r["vmid"]), r.get("name")) for r in pvesh("/cluster/resources") if r.get("type") in ("lxc", "qemu")}
+
+
+def debian_vorlage(auffrischen=False):
+    """Neueste Debian-Standardvorlage – wie in den Install-Skripten der Apps."""
+    if auffrischen:
+        ausfuehren(["pveam", "update"], timeout=300)
+    rc, out, _ = ausfuehren(["pveam", "available", "--section", "system"], timeout=60)
+    namen = [z.split()[1] for z in out.splitlines() if len(z.split()) == 2 and VORLAGE_RE.match(z.split()[1])]
+    return max(namen, key=versions_schluessel) if namen else None
+
+
+def anlegen_optionen():
+    return {"naechste_id": int(pvesh("/cluster/nextid")), "speicher": speicher("rootdir"), "bruecken": bruecken(),
+            "vorlage": debian_vorlage()}
+
+
+def anlege_parameter(args):
+    p = {"name": args[0], "cores": 1, "memory": 1024, "disk": 8, "storage": "", "bridge": "vmbr0", "vlan": None,
+         "ip": "dhcp", "gw": "", "ctid": None, "onboot": True, "start": True}
+    if not NAME_RE.match(p["name"]):
+        raise Fehler("Name: nur Kleinbuchstaben, Ziffern und Bindestrich, z. B. „homeassistant“.")
+    grenzen = {"cores": (1, 64), "memory": (256, 262144), "disk": (2, 4096), "vlan": (1, 4094), "ctid": (100, 999999999)}
+    for opt in args[1:]:
+        schluessel, gleich, wert = opt.partition("=")
+        k = schluessel[2:] if schluessel.startswith("--") and gleich else ""
+        if k in grenzen:
+            if not re.fullmatch(r"[0-9]{1,9}", wert) or not grenzen[k][0] <= int(wert) <= grenzen[k][1]:
+                raise Fehler(f"--{k} muss zwischen {grenzen[k][0]} und {grenzen[k][1]} liegen.")
+            p[k] = int(wert)
+        elif k == "ip":
+            if wert != "dhcp":
+                try:
+                    netz = ipaddress.IPv4Interface(wert)
+                except ValueError:
+                    raise Fehler("IP-Adresse bitte mit Präfix angeben, z. B. 192.168.10.70/24 – oder dhcp.")
+                if "/" not in wert or netz.network.prefixlen in (0, 32):
+                    raise Fehler("IP-Adresse bitte mit Präfix angeben, z. B. 192.168.10.70/24.")
+            p["ip"] = wert
+        elif k == "gw":
+            try:
+                p["gw"] = str(ipaddress.IPv4Address(wert)) if wert else ""
+            except ValueError:
+                raise Fehler("Ungültiges Gateway.")
+        elif k in ("bridge", "storage"):
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", wert):
+                raise Fehler(f"Ungültiger Wert für --{k}.")
+            p[k] = wert
+        elif k in ("onboot", "start"):
+            if wert not in ("0", "1"):
+                raise Fehler(f"--{k} ist 0 oder 1.")
+            p[k] = wert == "1"
+        else:
+            raise Fehler(f"Unbekannte Option: {opt[:40]}")
+    if p["ip"] != "dhcp":
+        if not p["gw"]:
+            raise Fehler("Bei fester IP-Adresse bitte auch das Gateway angeben.")
+        if ipaddress.IPv4Address(p["gw"]) not in ipaddress.IPv4Interface(p["ip"]).network:
+            raise Fehler("Das Gateway liegt nicht im Netz der IP-Adresse.")
+    if p["bridge"] not in bruecken():
+        raise Fehler(f"Netzwerk-Brücke {p['bridge']} gibt es auf diesem Host nicht.")
+    namen = [s["name"] for s in speicher("rootdir")]
+    if not namen:
+        raise Fehler("Kein aktiver Speicher für Container gefunden.")
+    p["storage"] = p["storage"] or namen[0]
+    if p["storage"] not in namen:
+        raise Fehler(f"Speicher {p['storage']} kann keine Container aufnehmen.")
+    vorhanden = belegt()
+    if p["ctid"] and p["ctid"] in {gid for gid, _ in vorhanden}:
+        raise Fehler(f"Die ID {p['ctid']} ist schon vergeben.")
+    if p["name"] in {name for _, name in vorhanden}:
+        raise Fehler(f"Einen Gast „{p['name']}“ gibt es schon.")
+    return p
+
+
+def a_anlegen(job, log):
+    p = job["param"]
+    log.abschnitt("Debian-Vorlage suchen")
+    vorlage = debian_vorlage(auffrischen=True)
+    if not vorlage:
+        raise Fehler("Keine Debian-Vorlage gefunden (pveam available --section system).")
+    ablagen = [s["name"] for s in speicher("vztmpl")]
+    if not ablagen:
+        raise Fehler("Kein Speicher für Vorlagen gefunden.")
+    ablage = "local" if "local" in ablagen else ablagen[0]
+    rc, out, _ = ausfuehren(["pveam", "list", ablage], timeout=60)
+    if vorlage not in out:
+        log.zeile(f"Lade {vorlage} nach {ablage} …")
+        if log.befehl(["pveam", "download", ablage, vorlage], timeout=1800):
+            raise Fehler("Die Vorlage konnte nicht geladen werden – Details im Protokoll.")
+    gid = p["ctid"] or int(pvesh("/cluster/nextid"))
+    vorhanden = belegt()
+    if gid in {g for g, _ in vorhanden}:
+        raise Fehler(f"Die ID {gid} ist inzwischen vergeben.")
+    if p["name"] in {name for _, name in vorhanden}:
+        raise Fehler(f"Einen Gast „{p['name']}“ gibt es inzwischen.")
+    job_felder(job, gast=gid)
+    netz = f"name=eth0,bridge={p['bridge']},ip={p['ip']}"
+    netz += f",gw={p['gw']}" if p["ip"] != "dhcp" else ""
+    netz += f",tag={p['vlan']}" if p["vlan"] else ""
+    log.abschnitt(f"Container {gid} „{p['name']}“ anlegen")
+    if log.befehl(["pct", "create", gid, f"{ablage}:vztmpl/{vorlage}", "--hostname", p["name"],
+                   "--cores", p["cores"], "--memory", p["memory"], "--swap", 512, "--rootfs", f"{p['storage']}:{p['disk']}",
+                   "--net0", netz, "--unprivileged", 1, "--features", "nesting=1", "--onboot", int(p["onboot"]),
+                   "--ostype", "debian", "--timezone", "host",
+                   "--description", f"Angelegt über die Übersicht (ecspve) am {time.strftime('%d.%m.%Y %H:%M')}."],
+                  timeout=1800):
+        raise Fehler("Der Container konnte nicht angelegt werden – Details im Protokoll.")
+    # Root-Passwort im laufenden Container setzen (über stdin – so steht es weder in der Prozessliste noch im Protokoll)
+    if log.befehl(["pct", "start", gid], timeout=300):
+        return "warnung", f"Container {gid} angelegt, startet aber nicht – Details im Protokoll."
+    zeichen = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    passwort = "".join(secrets.choice(zeichen) for _ in range(20))
+    for _ in range(10):
+        rc, _, err = ausfuehren(["pct", "exec", gid, "--", "true"], timeout=30)
+        if rc == 0:
+            break
+        time.sleep(2)
+    try:
+        p_rc = subprocess.run(["pct", "exec", str(gid), "--", "chpasswd"], input=f"root:{passwort}\n", text=True,
+                              capture_output=True, timeout=60).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        p_rc = 1
+    warnungen = []
+    if p_rc == 0:
+        log.zeile("Root-Passwort gesetzt (steht oben im Auftrag).")
+        job_felder(job, geheim={"Root-Passwort": passwort})
+    else:
+        warnungen.append("Root-Passwort konnte nicht gesetzt werden.")
+    log.abschnitt("Auf Netzwerk warten")
+    netz_da = False
+    for _ in range(30):
+        if ausfuehren(["pct", "exec", gid, "--", "getent", "hosts", "deb.debian.org"], timeout=30)[0] == 0:
+            netz_da = True
+            break
+        time.sleep(2)
+    if netz_da:
+        log.abschnitt("Erstes Update des Betriebssystems")
+        if log.befehl(["pct", "exec", gid, "--", "env", *APT_ENV, "sh", "-c", APT_UPGRADE]):
+            warnungen.append("Erstes Update fehlgeschlagen.")
+    else:
+        warnungen.append("Kein Internet im Container (Netzwerk, VLAN, DNS prüfen) – erstes Update übersprungen.")
+    if not p["start"]:
+        log.befehl(["pct", "shutdown", gid, "--timeout", "60"], timeout=300)
+    text = f"Container {gid} „{p['name']}“ angelegt" + ("" if p["start"] else " und wieder ausgeschaltet")
+    return ("warnung", f"{text}. {' '.join(warnungen)}") if warnungen else ("ok", text)
+
+
+def job_felder(job, **felder):
+    aktuell = lies(job["id"])
+    aktuell.update(felder)
+    schreibe(aktuell)
+    job.update(felder)
+
+
 AUSFUEHRUNG = {"strom": a_strom, "update": a_update, "dienst": a_dienst,
-               "host-update": a_host_update, "auffrischen": a_auffrischen}
+               "host-update": a_host_update, "auffrischen": a_auffrischen, "anlegen": a_anlegen}
 
 
 # --- Befehle -----------------------------------------------------------------------------------------
@@ -758,6 +979,24 @@ def befehl(argv, intern):
         return neuer_auftrag("host-update", f"Update Proxmox-Host {KNOTEN}")
     if name == "auffrischen" and not args:
         return neuer_auftrag("auffrischen", "Paketlisten in den Containern neu laden")
+    if name == "anlegen-optionen" and not args:
+        return anlegen_optionen()
+    if name == "anlegen" and args:
+        p = anlege_parameter(args)
+        return neuer_auftrag("anlegen", f"Container anlegen: {p['name']}", **p)
+    if name == "pruefung" and len(args) == 2:
+        gid, typ = lokaler_gast(args[0])
+        if typ != "lxc":
+            raise Fehler("Funktionsprüfungen gibt es nur für Container.")
+        if lade_konf().get(f"PRUEFUNG_{gid}", "").strip():
+            raise Fehler("Für diesen Container steht die Prüfung in /etc/ecspve/helfer.conf auf dem Host – dort ändern.")
+        daten = gespeicherte_pruefungen()
+        if args[1] == "--aus":
+            daten.pop(str(gid), None)
+        else:
+            daten[str(gid)] = pruef_adresse(args[1])
+        schreibe_json(PRUEFUNGEN, daten)
+        return {"ok": True, "pruefung": daten.get(str(gid))}
     if name == "auftrag" and len(args) == 1:
         job = lies(args[0])
         try:

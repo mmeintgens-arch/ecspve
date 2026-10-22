@@ -604,6 +604,11 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
             return self.senden(200, st)
         if pfad == "/metrics":
             return self.senden(200, metriken(self.sammler.status()), "text/plain; version=0.0.4; charset=utf-8")
+        if pfad == "/api/anlegen" and sitzung:
+            try:
+                return self.senden(200, helfer("anlegen-optionen", timeout=90))
+            except HelferFehler as e:
+                return self.fehler(502, str(e))
         m = re.fullmatch(r"/api/auftrag/([0-9a-f-]+)", pfad)
         if m and sitzung and AUFTRAG_RE.match(m.group(1)):
             try:
@@ -638,6 +643,10 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
                 erg = self.auto(daten)
             elif pfad == "/api/alle":
                 erg = self.alle_aktualisieren()
+            elif pfad == "/api/anlegen":
+                erg = self.anlegen(daten)
+            elif pfad == "/api/pruefung":
+                erg = self.pruefung(daten)
             elif pfad == "/api/pruefen":
                 self.sammler.pruef_wecker.set()
                 self.sammler.wecker.set()
@@ -694,6 +703,26 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
                 raise ValueError(dienst)
             return helfer("dienst", g["id"], dienst)
         raise ValueError(aktion)
+
+    def anlegen(self, daten):
+        """Neuen Container anlegen – geprüft wird alles im Helfer, hier nur die Form der Werte."""
+        args = ["anlegen", str(daten["name"]).strip()]
+        for k in ("cores", "memory", "disk", "vlan", "ctid"):
+            if daten.get(k) not in (None, ""):
+                args.append(f"--{k}={int(daten[k])}")
+        for k in ("storage", "bridge", "ip", "gw"):
+            if daten.get(k):
+                args.append(f"--{k}={str(daten[k]).strip()}")
+        for k in ("onboot", "start"):
+            args.append(f"--{k}={1 if daten.get(k, True) else 0}")
+        return helfer(*args, timeout=90)
+
+    def pruefung(self, daten):
+        g = self.gast(daten)
+        adresse = str(daten.get("adresse") or "").strip()
+        erg = helfer("pruefung", g["id"], adresse or "--aus", timeout=30)
+        self.sammler.pruef_wecker.set()
+        return erg
 
     def host_aktion(self, daten):
         if daten.get("aktion") == "update":

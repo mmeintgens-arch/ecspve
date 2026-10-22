@@ -141,6 +141,53 @@ class HelferBefehle(unittest.TestCase):
         rc, mit_log = helfer_aufruf("auftrag", job["id"])
         self.assertIn("turnierapp-update", mit_log["protokoll"])
 
+    def test_anlegen(self):
+        rc, d = helfer_aufruf("anlegen-optionen")
+        self.assertEqual(d["bruecken"], ["vmbr0", "vmbr1"])
+        self.assertEqual([s["name"] for s in d["speicher"]], ["local-lvm"])  # inaktive fallen weg
+        self.assertTrue(d["vorlage"].startswith("debian-13-standard"))
+        for args in (["Gross"], ["ha", "--ip=192.168.10.70"], ["ha", "--ip=192.168.10.70/24", "--gw=10.0.0.1"],
+                     ["ha", "--ip=192.168.10.70/24"], ["ha", "--bridge=vmbr9"], ["ha", "--storage=backup"],
+                     ["ha", "--ctid=101"], ["ecswiki"], ["ha", "--cores=2;id"], ["ha", "--memory=99"], ["ha", "--boese=1"]):
+            rc, d = helfer_aufruf("anlegen", *args)
+            self.assertEqual(rc, 1, args)
+            self.assertIn("fehler", d)
+        rc, job = helfer_aufruf("anlegen", "neuer-ct", "--ip=192.168.10.70/24", "--gw=192.168.10.1", "--vlan=10",
+                                "--onboot=0", "--start=0")
+        self.assertEqual(rc, 0, job)
+        fertig = warte_auf_auftrag(job["id"], 90)
+        self.assertEqual(fertig["status"], "ok", fertig)
+        self.assertEqual(len(fertig["geheim"]["Root-Passwort"]), 20)
+        rc, mit_log = helfer_aufruf("auftrag", job["id"])
+        self.assertNotIn(fertig["geheim"]["Root-Passwort"], mit_log["protokoll"])
+        self.assertIn("ip=192.168.10.70/24,gw=192.168.10.1,tag=10", mit_log["protokoll"])
+        rc, ueb = helfer_aufruf("uebersicht")
+        neu = next(g for g in ueb["gaeste"] if g["name"] == "neuer-ct")
+        self.assertEqual((neu["id"], neu["status"], neu["onboot"]), (fertig["gast"], "stopped", False))
+        self.assertFalse(any("geheim" in a for a in ueb["auftraege"]))  # Passwort nie in der Liste
+
+    def test_eigene_pruefung(self):
+        for args in (["120", "file:///etc/shadow"], ["120", "http://x/ ; id"], ["200", "http://127.0.0.1/"]):
+            rc, d = helfer_aufruf("pruefung", *args)
+            self.assertEqual(rc, 1, args)
+        rc, d = helfer_aufruf("pruefung", "120", "http://127.0.0.1:2019/config/")
+        self.assertEqual(rc, 0, d)
+        self.assertEqual([(p["app"], p["ok"]) for p in helfer.probe(120)["pruefungen"]], [("eigen", False)])
+        rc, ueb = helfer_aufruf("uebersicht")
+        self.assertEqual(next(g for g in ueb["gaeste"] if g["id"] == 120)["pruefung_eigen"]["quelle"], "oberflaeche")
+        helfer_aufruf("pruefung", "120", "--aus")
+        self.assertEqual(helfer.probe(120)["pruefungen"], [])
+        # helfer.conf hat Vorrang und lässt sich über die Oberfläche nicht ändern
+        konf = ORDNER / "helfer.conf"
+        vorher = konf.read_text()
+        konf.write_text(vorher + "PRUEFUNG_102=http://127.0.0.1:3000/healthz\n")
+        try:
+            rc, d = helfer_aufruf("pruefung", "102", "http://127.0.0.1/")
+            self.assertEqual(rc, 1)
+            self.assertIn("helfer.conf", d["fehler"])
+        finally:
+            konf.write_text(vorher)
+
     def test_dienst_und_strom(self):
         rc, job = helfer_aufruf("dienst", "104", "eventcrew-worker.service")
         self.assertEqual(warte_auf_auftrag(job["id"])["status"], "ok")
@@ -253,6 +300,20 @@ class Weboberflaeche(unittest.TestCase):
         status, text, _ = self.anfrage("GET", f"/api/auftrag/{job['id']}", kopf={"Cookie": cookie})
         self.assertEqual(json.loads(text)["gast"], 104)
         warte_auf_auftrag(job["id"])
+        # Container anlegen und eigene Prüfung über die Oberfläche
+        status, text, _ = self.anfrage("GET", "/api/anlegen", kopf={"Cookie": cookie})
+        self.assertEqual(json.loads(text)["bruecken"], ["vmbr0", "vmbr1"])
+        status, text, _ = self.anfrage("POST", "/api/anlegen", {"name": "Mit Leerzeichen"}, kopf)
+        self.assertEqual(status, 409)
+        self.assertIn("Kleinbuchstaben", json.loads(text)["fehler"])
+        status, text, _ = self.anfrage("POST", "/api/anlegen", {"name": "web-neu", "cores": "2", "memory": "2048",
+                                                                 "ip": "dhcp", "onboot": False, "start": False}, kopf)
+        self.assertEqual(status, 200, text)
+        self.assertEqual(warte_auf_auftrag(json.loads(text)["id"], 90)["status"], "ok")
+        status, text, _ = self.anfrage("POST", "/api/pruefung", {"id": 120, "adresse": "ftp://x/"}, kopf)
+        self.assertEqual(status, 409)
+        self.assertEqual(self.anfrage("POST", "/api/pruefung", {"id": 120, "adresse": "http://127.0.0.1:2019/"}, kopf)[0], 200)
+        self.assertEqual(self.anfrage("POST", "/api/pruefung", {"id": 120, "adresse": ""}, kopf)[0], 200)
         # Abmelden beendet die Sitzung
         self.anfrage("POST", "/api/abmelden", {}, kopf)
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 401)

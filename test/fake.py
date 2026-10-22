@@ -10,6 +10,7 @@ echte Prüfskript des Helfers aus – mit nachgebauten Befehlen und Dateien je C
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -68,12 +69,21 @@ GAESTE = {
 }
 
 
-def ressourcen(zustand):
+def alle_gaeste(ordner):
+    """Die festen Gäste plus die, die ein Test mit „pct create“ angelegt hat."""
+    gaeste = dict(GAESTE)
+    for gid, g in zustand_lesen(ordner).get("neu", {}).items():
+        gaeste[int(gid)] = g
+    return gaeste
+
+
+def ressourcen(ordner):
+    zustand = zustand_lesen(ordner)
     res = [{"type": "node", "node": "pve", "id": "node/pve", "status": "online", "cpu": 0.046, "maxcpu": 8,
             "mem": 9.1 * 2**30, "maxmem": 31.2 * 2**30, "disk": 18.4 * 2**30, "maxdisk": 94 * 2**30,
             "uptime": 1_211_000},
            {"type": "storage", "node": "pve", "storage": "local-lvm", "id": "storage/pve/local-lvm"}]
-    for gid, g in GAESTE.items():
+    for gid, g in alle_gaeste(ordner).items():
         typ = g.get("typ", "lxc")
         status = zustand.get(str(gid), g.get("status", "running"))
         maxmem = (2 if gid in (101, 104) else 1) * 2**30
@@ -97,20 +107,34 @@ def zustand_lesen(ordner):
         return {}
 
 
-def zustand_setzen(ordner, gid, status):
+def zustand_setzen(ordner, gid, status, neu=None):
     z = zustand_lesen(ordner)
     z[str(gid)] = status
+    if neu:
+        z.setdefault("neu", {})[str(gid)] = neu
     (ordner / "zustand.json").write_text(json.dumps(z))
 
 
 def befehl(name, args, ordner):
     ct = os.environ.get("FAKE_CT")
     if ct:
-        return im_container(name, args, GAESTE[int(ct)])
+        return im_container(name, args, alle_gaeste(ordner)[int(ct)])
     if name == "pvesh":
         pfad = args[1]
         if pfad == "/cluster/resources":
-            print(json.dumps(ressourcen(zustand_lesen(ordner))))
+            print(json.dumps(ressourcen(ordner)))
+        elif pfad == "/cluster/nextid":
+            belegt = set(alle_gaeste(ordner))
+            print(json.dumps(str(next(i for i in range(100, 10**6) if i not in belegt))))
+        elif pfad == "/nodes/pve/storage":
+            if "vztmpl" in args:
+                print(json.dumps([{"storage": "local", "type": "dir", "active": 1, "avail": 60 * 2**30, "total": 94 * 2**30}]))
+            else:
+                print(json.dumps([{"storage": "local-lvm", "type": "lvmthin", "active": 1, "avail": 310 * 2**30,
+                                   "total": 400 * 2**30},
+                                  {"storage": "backup", "type": "nfs", "active": 0, "avail": 0, "total": 0}]))
+        elif pfad == "/nodes/pve/network":
+            print(json.dumps([{"iface": "vmbr0", "type": "bridge"}, {"iface": "vmbr1", "type": "bridge"}]))
         elif pfad.endswith("/apt/update"):
             print(json.dumps([{"Package": "pve-manager", "OldVersion": "8.4.1", "Version": "8.4.2"},
                               {"Package": "proxmox-kernel-6.8", "OldVersion": "6.8.12-9", "Version": "6.8.12-10"},
@@ -131,6 +155,17 @@ def befehl(name, args, ordner):
         return 0
     if name in ("pct", "qm"):
         return pct(name, args, ordner)
+    if name == "pveam":
+        if args[:1] == ["available"]:
+            print("system          debian-12-standard_12.12-1_amd64.tar.zst\n"
+                  "system          debian-13-standard_13.1-2_amd64.tar.zst\n"
+                  "system          ubuntu-24.04-standard_24.04-2_amd64.tar.zst")
+        elif args[:1] == ["list"]:
+            print("NAME                                                         SIZE\n"
+                  "local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst        120.30MB")
+        else:
+            print(f"(Attrappe) pveam {' '.join(args)}")
+        return 0
     if name == "git":
         print("Already up to date.")
         return 0
@@ -143,7 +178,9 @@ def befehl(name, args, ordner):
 
 def pct(name, args, ordner):
     unter, gid = args[0], args[1] if len(args) > 1 else ""
-    g = GAESTE.get(int(gid)) if gid.isdigit() else None
+    if unter == "create":
+        return pct_create(int(gid), args, ordner)
+    g = alle_gaeste(ordner).get(int(gid)) if gid.isdigit() else None
     if g is None:
         print(f"Configuration file 'nodes/pve/lxc/{gid}.conf' does not exist", file=sys.stderr)
         return 2
@@ -169,9 +206,33 @@ def pct(name, args, ordner):
         befehl_ct = args[args.index("--") + 1:]
         if befehl_ct[:2] == ["sh", "-c"]:
             return pruefskript(int(gid), g, befehl_ct[2], ordner)
+        if befehl_ct == ["chpasswd"]:
+            sys.stdin.read()
+            return 0
+        if befehl_ct[0] in ("true", "getent"):
+            return 0
         print(f"(Attrappe im Container {gid}) {' '.join(befehl_ct)}")
         time.sleep(0.5)
         return 0
+    return 0
+
+
+def pct_create(gid, args, ordner):
+    opt = {args[i][2:]: args[i + 1] for i in range(3, len(args) - 1) if args[i].startswith("--")}
+    if gid in alle_gaeste(ordner):
+        print(f"CT {gid} already exists on node 'pve'", file=sys.stderr)
+        return 255
+    ip = re.search(r"ip=([0-9.]+)/", opt.get("net0", ""))
+    neu = {"name": opt["hostname"], "mem": 0.04, "disk": 0.09, "cpu": 0.001, "uptime": 20,
+           "os": "Debian GNU/Linux 13 (trixie)", "ip": ip.group(1) if ip else "192.168.10.77", "updates": 0,
+           "einheiten": [], "status": "stopped"}
+    zustand_setzen(ordner, gid, "stopped", neu)
+    (ordner / "pve/nodes/pve/lxc" / f"{gid}.conf").write_text(
+        f"hostname: {opt['hostname']}\nonboot: {opt.get('onboot', '0')}\nnet0: {opt.get('net0', '')}\n")
+    wurzel = ordner / "ct" / str(gid)
+    (wurzel / "systemd").mkdir(parents=True)
+    (wurzel / "os-release").write_text(f'PRETTY_NAME="{neu["os"]}"\n')
+    print(f"(Attrappe) Container {gid} aus {args[2]} angelegt")
     return 0
 
 
@@ -230,7 +291,7 @@ def anlegen(ordner):
                        f"import fake\nfrom pathlib import Path\n"
                        f"sys.exit(fake.befehl(os.path.basename(sys.argv[0]), sys.argv[1:], Path({str(ordner)!r})))\n")
     starter.chmod(0o755)
-    for n in ("pct", "pvesh", "qm", "pveversion", "systemctl", "apt-get", "git", "pve-install.sh",
+    for n in ("pct", "pvesh", "qm", "pveam", "pveversion", "systemctl", "apt-get", "git", "pve-install.sh",
               "turnierapp-update-lxc", "create-lxc.sh"):
         (ordner / "bin" / n).symlink_to(starter)
     for n in ("systemctl", "apt-get", "hostname", "curl", "python3", "ecspve"):

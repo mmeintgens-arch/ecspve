@@ -22,6 +22,8 @@ Schnittstellen für Monitoring-Werkzeuge und nächtliche automatische Updates.
 | | Dienst neu starten | Klick auf den Dienst (z. B. den roten `eventcrew-worker`) |
 | | Aktualisieren: System und App, nur Betriebssystem, nur App – vorher ein Snapshot | „Aktualisieren“ bzw. „Mehr“ |
 | | alle Container nacheinander aktualisieren, Proxmox-Host aktualisieren | Knöpfe über den Karten bzw. in der Host-Karte |
+| | neuen Container anlegen: Name, CPU, RAM, Disk, Speicher, Netzwerk, IP – Debian, unprivilegiert, mit erstem Update | „Container anlegen“ |
+| | eigene Funktionsprüfung für jeden Container (eine Adresse im Container) | „festlegen“ in der Karte bzw. „Mehr“ |
 | | jedes Update, jeder Neustart mit vollständigem Protokoll | Liste „Aufträge“ |
 | Automatisch | Nachtlauf um 04:30 (nach den Sicherungen der Apps): je Container per Häkchen **System** und/oder **App**; Paketlisten überall auffrischen; Bericht auf der Seite und per Benachrichtigung | Karte „Automatische Updates“ |
 | Monitoring | `/health` (200/503), `/api/status` (JSON), `/metrics` (Prometheus), Push an ntfy, Heartbeat an Uptime Kuma/healthchecks.io | [Monitoring anbinden](#monitoring-anbinden) |
@@ -69,9 +71,36 @@ Erkannt wird eine App an ihrer systemd-Einheit im Container – egal, welche ID 
 | StreetworkDoc | `streetworkdoc.service` | `https://127.0.0.1:8443/api/v1/info` | `git pull` + `deploy/proxmox/create-lxc.sh --update <ID>` im Projektordner (`STREETWORKDOC_QUELLE`) |
 | Übersicht (diese App) | `ecspve.service` | `ecspve ping` | `/opt/ecspve/pve-install.sh --pull --update --ctid=<ID>` |
 
-Andere Container (z. B. euer Caddy) zeigt die Übersicht genauso – mit Diensten, Updates und Betriebssystem-Update,
-nur ohne App-Prüfung und App-Update. Eigene Prüfungen und Update-Befehle je Container gehen in
-`/etc/ecspve/helfer.conf` auf dem Host (siehe [Einstellungen](#einstellungen)).
+Die Übersicht ist nicht auf diese Apps beschränkt: **jeder** Container und jede VM auf dem Host erscheint von selbst,
+auch neue – nach etwa 10 Sekunden. Andere Container (z. B. euer Caddy) zeigt sie genauso, mit Diensten, Updates und
+Betriebssystem-Update, nur ohne App-Prüfung und App-Update. Eine eigene Funktionsprüfung legt ihr direkt in der Karte
+fest (siehe unten), eigene Update-Befehle in `/etc/ecspve/helfer.conf` auf dem Host (siehe
+[Einstellungen](#einstellungen)) – die laufen als root auf dem Host und gehören deshalb nicht in die Weboberfläche.
+VMs zeigt die Übersicht mit Status, Ressourcen und Starten/Stoppen; in eine VM hinein kommt der Helfer nicht.
+
+### Container anlegen
+
+![Container anlegen](docs/anlegen.png)
+
+**Container anlegen** über den Karten öffnet ein Formular: Name, Container-ID (sonst die nächste freie), CPU-Kerne,
+Arbeitsspeicher, Festplatte, Speicherort, Netzwerk-Brücke, VLAN, IP-Adresse (DHCP oder fest mit Gateway), Autostart.
+Daraus wird – wie bei den Install-Skripten der Apps – ein unprivilegierter Container mit der neuesten
+Debian-Standardvorlage (`nesting=1`, Zeitzone des Hosts). Danach startet er, bekommt ein zufälliges Root-Passwort
+und gleich sein erstes Update. Das Passwort steht **nur** im Protokoll dieses Auftrags (nicht in der Auftragsliste,
+nicht in der Protokolldatei) – damit meldet ihr euch in der Proxmox-Konsole als root an. Ist „eingeschaltet lassen“ aus,
+wird der Container nach dem Einrichten wieder heruntergefahren. Die Software darin installiert ihr wie gewohnt.
+
+Mehrere neue Container und Updates laufen nacheinander, nie gleichzeitig. Löschen geht bewusst nur in der
+Proxmox-Oberfläche.
+
+### Eigene Funktionsprüfung
+
+Für Container ohne eingebaute Prüfung steht in der Karte „keine Prüfung · **festlegen**“ (sonst unter **Mehr**). Dort
+tragt ihr eine Adresse ein, die die Übersicht jede Minute **im Container selbst** aufruft, z. B.
+`http://127.0.0.1:8123/` für Home Assistant oder `http://127.0.0.1:2019/config/` für Caddy. Antwortet sie mit 200 bis
+399, ist alles in Ordnung, sonst wird die Karte rot und es gibt eine Benachrichtigung. Bei einer der eingebauten Apps
+ersetzt die eigene Adresse deren Prüfung; leer lassen = wieder die eingebaute. Gespeichert wird auf dem Host in
+`/var/lib/ecspve-helfer/pruefungen.json`; ein Eintrag `PRUEFUNG_<ID>` in `helfer.conf` hat Vorrang.
 
 ## Installation
 
@@ -217,7 +246,7 @@ Ordnung“ und das Ergebnis jedes Nachtlaufs.
 |---|---|---|
 | `STREETWORKDOC_QUELLE` | `/root/StreetworkDoc` | Projektordner von StreetworkDoc für dessen App-Update |
 | `HOST_UPDATE` | `ja` | Host-Updates über die Übersicht erlauben (`nein` = nur anzeigen) |
-| `PRUEFUNG_<ID>` | – | eigene Funktionsprüfung im Container: Adresse (`http://127.0.0.1:8123/`) oder Befehl |
+| `PRUEFUNG_<ID>` | – | eigene Funktionsprüfung im Container: Adresse (`http://127.0.0.1:8123/`) oder Befehl – hat Vorrang vor der Einstellung in der Weboberfläche |
 | `UPDATE_<ID>` | – | eigener App-Update-Befehl auf dem Host, `{id}` = Container-ID |
 
 Die Auswahl „nachts automatisch“ und der Bericht des letzten Nachtlaufs liegen im Container in `/var/lib/ecspve`.
@@ -253,7 +282,7 @@ Passwort, Token und Auswahl bleiben. Mit dem Häkchen **App** in der Karte der �
 
 ## Sicherheit
 
-- Die Weboberfläche kann Container neu starten und Updates anstoßen – nur hinter eurem Caddy mit HTTPS betreiben,
+- Die Weboberfläche kann Container anlegen, neu starten und Updates anstoßen – nur hinter eurem Caddy mit HTTPS betreiben,
   am besten nur aus dem Vereinsnetz bzw. per VPN erreichbar.
 - Anmeldung mit Passwort (PBKDF2), Sitzung 12 Stunden, nach 5 Fehlversuchen 15 Minuten Sperre je IP.
   Aktionen brauchen einen eigenen Header (Schutz vor fremden Formularen), Cookies sind `HttpOnly` und

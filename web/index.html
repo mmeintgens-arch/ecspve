@@ -34,6 +34,7 @@
         <span id="pruefstand" class="leise-text"></span>
         <button id="pruefen" type="button">Jetzt prüfen</button>
         <button id="alle" type="button">Alle aktualisieren</button>
+        <button id="anlegen" type="button" class="haupt">Container anlegen</button>
       </div>
     </div>
     <div id="gaeste" class="raster"></div>
@@ -72,7 +73,79 @@
     <button id="protokoll-zu" type="button" class="leise">Schließen</button>
   </div>
   <p id="protokoll-status"></p>
+  <div id="protokoll-geheim" class="geheim" hidden></div>
   <pre id="protokoll-text"></pre>
+</dialog>
+
+<dialog id="anlegen-dialog">
+  <form id="anlegen-form" novalidate>
+    <div class="dialog-kopf">
+      <h2>Neuen Container anlegen</h2>
+      <button type="button" class="leise" data-schliessen>Abbrechen</button>
+    </div>
+    <div class="formular">
+      <p class="leise-text" id="anlegen-info">Debian, unprivilegiert – wie die Container der Apps.</p>
+      <div class="felder">
+        <label>Name <input name="name" maxlength="63" placeholder="z. B. homeassistant" autocomplete="off" required></label>
+        <label>Container-ID <input name="ctid" type="number" min="100" placeholder="automatisch"></label>
+        <label>CPU-Kerne <input name="cores" type="number" min="1" max="64" value="1"></label>
+        <label>Arbeitsspeicher
+          <select name="memory">
+            <option value="512">512 MB</option>
+            <option value="1024" selected>1 GB</option>
+            <option value="2048">2 GB</option>
+            <option value="4096">4 GB</option>
+            <option value="8192">8 GB</option>
+            <option value="16384">16 GB</option>
+          </select>
+        </label>
+        <label>Festplatte in GB <input name="disk" type="number" min="2" max="4096" value="8"></label>
+        <label>Speicherort <select name="storage"></select></label>
+        <label>Netzwerk-Brücke <select name="bridge"></select></label>
+        <label>VLAN <input name="vlan" type="number" min="1" max="4094" placeholder="keins"></label>
+      </div>
+      <fieldset class="wahl">
+        <legend>IP-Adresse</legend>
+        <label class="zeile"><input type="radio" name="ipart" value="dhcp" checked> automatisch (DHCP)</label>
+        <label class="zeile"><input type="radio" name="ipart" value="fest"> fest</label>
+        <div class="felder" id="ip-fest" hidden>
+          <label>IP mit Präfix <input name="ip" placeholder="192.168.10.70/24" autocomplete="off"></label>
+          <label>Gateway <input name="gw" placeholder="192.168.10.1" autocomplete="off"></label>
+        </div>
+      </fieldset>
+      <label class="zeile"><input type="checkbox" name="onboot" checked> mit dem Proxmox-Host starten</label>
+      <label class="zeile"><input type="checkbox" name="start" checked> nach dem Einrichten eingeschaltet lassen</label>
+      <p class="leise-text">Das Root-Passwort wird erzeugt und am Ende im Protokoll angezeigt. Danach gleich das erste
+        Update; Dienste installiert ihr wie gewohnt (z. B. mit den Install-Skripten der Apps).</p>
+      <p class="fehlertext" id="anlegen-fehler" role="alert"></p>
+    </div>
+    <div class="dialog-fuss">
+      <button type="button" data-schliessen>Abbrechen</button>
+      <button type="submit" class="haupt">Anlegen</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="pruefung-dialog">
+  <form id="pruefung-form" novalidate>
+    <div class="dialog-kopf">
+      <h2 id="pruefung-titel">Funktionsprüfung</h2>
+      <button type="button" class="leise" data-schliessen>Abbrechen</button>
+    </div>
+    <div class="formular">
+      <p>Die Übersicht ruft diese Adresse jede Minute <strong>im Container selbst</strong> auf. Antwortet sie mit
+        einem Statuscode von 200 bis 399, ist alles in Ordnung – sonst wird die Karte rot.</p>
+      <label class="feld">Adresse <input name="adresse" placeholder="http://127.0.0.1:8080/" autocomplete="off"></label>
+      <p class="leise-text">Beispiele: Home Assistant <code>http://127.0.0.1:8123/</code> · Nginx Proxy Manager
+        <code>http://127.0.0.1:81/</code> · Caddy <code>http://127.0.0.1:2019/config/</code>.
+        Leer lassen = keine eigene Prüfung<span id="pruefung-app"></span>.</p>
+      <p class="fehlertext" id="pruefung-fehler" role="alert"></p>
+    </div>
+    <div class="dialog-fuss">
+      <button type="button" data-schliessen>Abbrechen</button>
+      <button type="submit" class="haupt">Speichern</button>
+    </div>
+  </form>
 </dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 </body>

@@ -88,6 +88,7 @@
     if (a.art === "dienst") return `${p.dienst} neu starten${ziel}`;
     if (a.art === "host-update") return "Proxmox-Host aktualisieren";
     if (a.art === "auffrischen") return "Paketlisten neu laden";
+    if (a.art === "anlegen") return `Container „${p.name}“ anlegen${a.gast ? ` (${a.gast})` : ""}`;
     return a.titel || a.art;
   }
 
@@ -231,7 +232,11 @@
     if (pr.pruefungen.length) {
       zeilen.push(h("dt", {}, "Funktion"), h("dd", {}, pr.pruefungen.map((p, i) => [i ? " · " : "",
         p.ok ? h("span", { class: "gut", title: p.detail }, `✔ antwortet${p.ms !== null ? ` (${p.ms} ms)` : ""}`)
-          : h("span", { class: "schlecht" }, `✘ ${p.detail}`)])));
+          : h("span", { class: "schlecht" }, `✘ ${p.detail}`)]),
+        g.pruefung_eigen ? h("span", { class: "leise-text", title: g.pruefung_eigen.wert }, " · eigene Prüfung") : null));
+    } else if (g.lokal) {
+      zeilen.push(h("dt", {}, "Funktion"), h("dd", {}, h("span", { class: "leise-text" }, "keine Prüfung · "),
+        h("button", { type: "button", class: "leise", onclick: () => pruefungOeffnen(g) }, "festlegen")));
     }
     if (pr.os) zeilen.push(h("dt", {}, "System"), h("dd", {}, pr.os));
     let upd = pr.updates === null || pr.updates === undefined ? h("span", { class: "leise-text" }, "unbekannt")
@@ -290,6 +295,7 @@
         mehr.push(["Nur Betriebssystem aktualisieren", () => update(g, "system")]);
         mehr.push(["Nur App aktualisieren", () => update(g, "app"), Boolean(g.probe && g.probe.app_update)]);
       }
+      if (g.typ === "lxc") mehr.push(["Funktionsprüfung festlegen …", () => pruefungOeffnen(g)]);
       mehr.push(["Hart ausschalten", () => strom(g, "stopp")]);
       if (frei) knoepfe.push(menue("Mehr", mehr));
     }
@@ -453,12 +459,98 @@
       $("protokoll-status").replaceChildren(
         h("span", { class: `status-${a.status}` }, `${ZEICHEN[a.status] || ""} ${STATUS[a.status] || a.status}`),
         ` · gestartet ${zeit(a.start)}`, a.ende ? ` · Dauer ${dauer(a.ende - a.start)}` : "", a.ergebnis ? ` · ${a.ergebnis}` : "");
+      const geheim = $("protokoll-geheim");
+      geheim.hidden = !a.geheim;
+      if (a.geheim) {
+        geheim.replaceChildren(...Object.entries(a.geheim).map(([k, v]) => h("p", {}, `${k}: `, h("code", {}, v))),
+          h("p", { class: "leise-text" }, "Jetzt notieren – damit meldet ihr euch in der Proxmox-Konsole des Containers als root an."));
+      }
       pre.textContent = a.protokoll || "(noch keine Ausgabe)";
       if (unten) pre.scrollTop = pre.scrollHeight;
       if ((a.status === "laeuft" || a.status === "wartet") && d.open) protokollTimer = setTimeout(() => protokoll(id), 2000);
     } catch (e) {
       $("protokoll-status").textContent = e.message;
     }
+  }
+
+  // --- Container anlegen ----------------------------------------------------------------------------
+  async function anlegenOeffnen() {
+    const d = $("anlegen-dialog");
+    const f = $("anlegen-form");
+    f.reset();
+    $("ip-fest").hidden = true;
+    $("anlegen-fehler").textContent = "";
+    $("anlegen-info").textContent = "Speicher und Netzwerk werden geladen …";
+    d.showModal();
+    f.elements.name.focus();
+    try {
+      const o = await api("/api/anlegen");
+      f.elements.storage.replaceChildren(...o.speicher.map((s) =>
+        h("option", { value: s.name }, `${s.name}${s.frei ? ` (${bytes(s.frei)} frei)` : ""}`)));
+      f.elements.bridge.replaceChildren(...o.bruecken.map((b) => h("option", { value: b, selected: b === "vmbr0" }, b)));
+      f.elements.ctid.placeholder = `automatisch (${o.naechste_id})`;
+      const v = (o.vorlage || "").match(/^debian-(\d+)-standard_([^_]+)_/);
+      $("anlegen-info").textContent = `${v ? `Debian ${v[1]} (Vorlage ${v[2]})` : "Debian"}, unprivilegiert – wie die Container der Apps.`;
+    } catch (e) {
+      $("anlegen-info").textContent = "";
+      $("anlegen-fehler").textContent = e.message;
+    }
+  }
+  async function anlegenAbschicken(ev) {
+    ev.preventDefault();
+    const f = $("anlegen-form");
+    const w = (n) => f.elements[n].value.trim();
+    const fehler = $("anlegen-fehler");
+    fehler.textContent = "";
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(w("name"))) {
+      fehler.textContent = "Name: nur Kleinbuchstaben, Ziffern und Bindestrich, z. B. „homeassistant“.";
+      f.elements.name.focus();
+      return;
+    }
+    const fest = f.elements.ipart.value === "fest";
+    const daten = {
+      name: w("name"), ctid: w("ctid"), cores: w("cores"), memory: w("memory"), disk: w("disk"),
+      storage: w("storage"), bridge: w("bridge"), vlan: w("vlan"),
+      ip: fest ? w("ip") : "dhcp", gw: fest ? w("gw") : "",
+      onboot: f.elements.onboot.checked, start: f.elements.start.checked,
+    };
+    const knopf = f.querySelector("button[type=submit]");
+    knopf.disabled = true;
+    try {
+      const job = await api("/api/anlegen", daten);
+      $("anlegen-dialog").close();
+      toast(`${daten.name}: wird angelegt`);
+      laden();
+      protokoll(job.id);
+    } catch (e) { fehler.textContent = e.message; }
+    finally { knopf.disabled = false; }
+  }
+
+  // --- Eigene Funktionsprüfung ---------------------------------------------------------------------
+  let pruefGast = null;
+  function pruefungOeffnen(g) {
+    pruefGast = g;
+    const f = $("pruefung-form");
+    const eigen = g.pruefung_eigen;
+    const ausDatei = eigen && eigen.quelle === "helfer.conf";
+    $("pruefung-titel").textContent = `Funktionsprüfung · ${g.name}`;
+    f.elements.adresse.value = eigen ? eigen.wert : "";
+    f.elements.adresse.disabled = ausDatei;
+    f.querySelector("button[type=submit]").disabled = ausDatei;
+    $("pruefung-app").textContent = g.probe && g.probe.app_name ? ` (dann gilt wieder die eingebaute Prüfung der App ${g.probe.app_name})` : "";
+    $("pruefung-fehler").textContent = ausDatei ? "Diese Prüfung steht in /etc/ecspve/helfer.conf auf dem Proxmox-Host – dort ändern." : "";
+    $("pruefung-dialog").showModal();
+    if (!ausDatei) f.elements.adresse.focus();
+  }
+  async function pruefungAbschicken(ev) {
+    ev.preventDefault();
+    const adresse = $("pruefung-form").elements.adresse.value.trim();
+    try {
+      await api("/api/pruefung", { id: pruefGast.id, adresse });
+      $("pruefung-dialog").close();
+      toast(adresse ? `${pruefGast.name}: Prüfung gespeichert – Ergebnis in etwa einer Minute` : `${pruefGast.name}: eigene Prüfung entfernt`);
+      laden();
+    } catch (e) { $("pruefung-fehler").textContent = e.message; }
   }
 
   // --- Start ---------------------------------------------------------------------------------------
@@ -478,6 +570,13 @@
     });
     $("pruefen").addEventListener("click", () => auftrag("/api/pruefen", {}, "Prüfung läuft – Ergebnis in etwa einer Minute"));
     $("alle").addEventListener("click", alleAktualisieren);
+    $("anlegen").addEventListener("click", anlegenOeffnen);
+    $("anlegen-form").addEventListener("submit", anlegenAbschicken);
+    $("pruefung-form").addEventListener("submit", pruefungAbschicken);
+    for (const r of $("anlegen-form").elements.ipart) {
+      r.addEventListener("change", () => { $("ip-fest").hidden = $("anlegen-form").elements.ipart.value !== "fest"; });
+    }
+    document.querySelectorAll("[data-schliessen]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
     $("protokoll-zu").addEventListener("click", () => $("protokoll").close());
     $("protokoll").addEventListener("close", () => clearTimeout(protokollTimer));
     document.addEventListener("visibilitychange", () => { if (!document.hidden && $("anmeldung").hidden) laden(); });
