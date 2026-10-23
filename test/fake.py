@@ -227,6 +227,10 @@ def pct(name, args, ordner):
         return 0
     if unter == "exec":
         befehl_ct = args[args.index("--") + 1:]
+        while befehl_ct and befehl_ct[0] == "env":  # env PATH=… [VAR=…] befehl
+            befehl_ct = befehl_ct[1:]
+            while befehl_ct and "=" in befehl_ct[0]:
+                befehl_ct = befehl_ct[1:]
         if befehl_ct[:2] == ["sh", "-c"]:
             return pruefskript(int(gid), g, befehl_ct[2], ordner)
         if befehl_ct == ["chpasswd"]:
@@ -265,7 +269,8 @@ def pruefskript(gid, g, skript, ordner):
     skript = (skript.replace("/etc/systemd/system", str(wurzel / "systemd"))
               .replace("/etc/os-release", str(wurzel / "os-release"))
               .replace("/run/reboot-required", str(wurzel / "reboot-required"))
-              .replace("/run/ecspve-updates", str(wurzel / "updates-zwischenspeicher")))
+              .replace("/run/ecspve-updates", str(wurzel / "updates-zwischenspeicher"))
+              .replace("/usr/local/bin/ecspve", str(ordner / "ctbin" / "ecspve")))
     umgebung = {**os.environ, "FAKE_CT": str(gid), "PATH": f"{ordner / 'ctbin'}:{os.environ['PATH']}"}
     return os.spawnvpe(os.P_WAIT, "sh", ["sh", "-c", skript], umgebung)
 

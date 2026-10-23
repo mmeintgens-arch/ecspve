@@ -66,7 +66,13 @@ APT_UPGRADE = (
     "apt-get update -q && apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
     "full-upgrade && apt-get -y -q autoremove && apt-get -q clean"
 )
-APT_ENV = ["DEBIAN_FRONTEND=noninteractive", "APT_LISTCHANGES_FRONTEND=none", "NEEDRESTART_MODE=a"]
+APT_ENV = ["DEBIAN_FRONTEND=noninteractive", "APT_LISTCHANGES_FRONTEND=none", "NEEDRESTART_MODE=a", f"PATH={PFAD}"]
+
+
+def im_ct(gid, *befehl):
+    """Befehl im Container. pct gibt nur /sbin:/bin:/usr/sbin:/usr/bin mit – ohne /usr/local, wo z. B. ecspve und
+    turnierapp-update liegen. Deshalb den vollen Suchpfad selbst setzen."""
+    return ["pct", "exec", str(gid), "--", "env", f"PATH={PFAD}", *[str(b) for b in befehl]]
 
 # Die eigenen Apps: erkannt an ihrer systemd-Einheit im Container. "pruefung" ist eine Adresse im Container,
 # "pruefbefehl" ein Befehl im Container. "update" läuft auf dem Host – so, wie es die jeweilige Doku beschreibt.
@@ -81,16 +87,17 @@ APPS = [
     {"key": "turnierapp", "name": "Turniersystem", "merkmal": "turnierapp.service",
      "pruefung": "http://127.0.0.1:3000/healthz",
      "update": ["/usr/local/sbin/turnierapp-update-lxc", "{id}", "--pull"],
-     "ersatz": ["pct", "exec", "{id}", "--", "turnierapp-update"]},
+     "ersatz": ["pct", "exec", "{id}", "--", "env", f"PATH={PFAD}", "turnierapp-update"]},
     {"key": "ecsapp", "name": "Recherchetool", "merkmal": "eventcrew-web.service",
      "pruefbefehl": "python3 /opt/eventcrew-app/deploy/lxc/probe.py",
-     "update": ["pct", "exec", "{id}", "--", "bash", "/opt/eventcrew-app/deploy/lxc/update.sh"]},
+     "update": ["pct", "exec", "{id}", "--", "env", f"PATH={PFAD}", "bash",
+                "/opt/eventcrew-app/deploy/lxc/update.sh"]},
     {"key": "streetworkdoc", "name": "StreetworkDoc", "merkmal": "streetworkdoc.service",
      "pruefung": "https://127.0.0.1:8443/api/v1/info",
      "git": "{STREETWORKDOC_QUELLE}",
      "update": ["{STREETWORKDOC_QUELLE}/deploy/proxmox/create-lxc.sh", "--update", "{id}"]},
     {"key": "ecspve", "name": "Übersicht", "merkmal": "ecspve.service",
-     "pruefbefehl": "ecspve ping",
+     "pruefbefehl": "/usr/local/bin/ecspve ping",
      "update": ["/opt/ecspve/pve-install.sh", "--pull", "--update", "--ctid={id}"]},
 ]
 APPS_NACH_KEY = {a["key"]: a for a in APPS}
@@ -433,7 +440,7 @@ def werte_probe_aus(text):
 
 def probe(gid, konf=None):
     konf = konf or lade_konf()
-    rc, out, err = ausfuehren(["pct", "exec", str(gid), "--", "sh", "-c", probe_skript(gid, konf)], timeout=45)
+    rc, out, err = ausfuehren(im_ct(gid, "sh", "-c", probe_skript(gid, konf)), timeout=45)
     erg = werte_probe_aus(out)
     erg["zeit"] = time.time()
     if rc != 0 and not out.strip():
@@ -692,7 +699,7 @@ def a_update(job, log):
             warnungen.append(w)
     if was in ("alles", "system"):
         log.abschnitt("Betriebssystem im Container aktualisieren")
-        if log.befehl(["pct", "exec", gid, "--", "env", *APT_ENV, "sh", "-c", APT_UPGRADE]):
+        if log.befehl(im_ct(gid, "env", *APT_ENV, "sh", "-c", APT_UPGRADE)):
             raise Fehler("Update des Betriebssystems fehlgeschlagen – Details im Protokoll.")
     if was in ("alles", "app"):
         befehle = app_update_befehle(gid, vorher["apps"], konf)
@@ -734,8 +741,8 @@ def job_hinweise(job, hinweise):
 
 def a_dienst(job, log):
     gid, dienst = job["gast"], job["param"]["dienst"]
-    rc = log.befehl(["pct", "exec", gid, "--", "systemctl", "restart", dienst], timeout=300)
-    log.befehl(["pct", "exec", gid, "--", "systemctl", "--no-pager", "--lines=20", "status", dienst], timeout=60)
+    rc = log.befehl(im_ct(gid, "systemctl", "restart", dienst), timeout=300)
+    log.befehl(im_ct(gid, "systemctl", "--no-pager", "--lines=20", "status", dienst), timeout=60)
     return ("ok", f"{dienst} neu gestartet") if rc == 0 else ("fehler", f"{dienst} startet nicht (Code {rc})")
 
 
@@ -758,7 +765,7 @@ def a_auffrischen(job, log):
     fehler = []
     for r in pvesh("/cluster/resources"):
         if r.get("type") == "lxc" and r.get("node") == KNOTEN and r.get("status") == "running" and not r.get("template"):
-            if log.befehl(["pct", "exec", int(r["vmid"]), "--", "apt-get", "update", "-qq"], timeout=600):
+            if log.befehl(im_ct(r["vmid"], "apt-get", "update", "-qq"), timeout=600):
                 fehler.append(str(r["vmid"]))
     return ("warnung", f"Nicht möglich in: {', '.join(fehler)}") if fehler else ("ok", "Paketlisten aktuell")
 
@@ -887,12 +894,12 @@ def a_anlegen(job, log):
     zeichen = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
     passwort = "".join(secrets.choice(zeichen) for _ in range(20))
     for _ in range(10):
-        rc, _, err = ausfuehren(["pct", "exec", gid, "--", "true"], timeout=30)
+        rc, _, err = ausfuehren(im_ct(gid, "true"), timeout=30)
         if rc == 0:
             break
         time.sleep(2)
     try:
-        p_rc = subprocess.run(["pct", "exec", str(gid), "--", "chpasswd"], input=f"root:{passwort}\n", text=True,
+        p_rc = subprocess.run(im_ct(gid, "chpasswd"), input=f"root:{passwort}\n", text=True,
                               capture_output=True, timeout=60).returncode
     except (OSError, subprocess.TimeoutExpired):
         p_rc = 1
@@ -905,13 +912,13 @@ def a_anlegen(job, log):
     log.abschnitt("Auf Netzwerk warten")
     netz_da = False
     for _ in range(30):
-        if ausfuehren(["pct", "exec", gid, "--", "getent", "hosts", "deb.debian.org"], timeout=30)[0] == 0:
+        if ausfuehren(im_ct(gid, "getent", "hosts", "deb.debian.org"), timeout=30)[0] == 0:
             netz_da = True
             break
         time.sleep(2)
     if netz_da:
         log.abschnitt("Erstes Update des Betriebssystems")
-        if log.befehl(["pct", "exec", gid, "--", "env", *APT_ENV, "sh", "-c", APT_UPGRADE]):
+        if log.befehl(im_ct(gid, "env", *APT_ENV, "sh", "-c", APT_UPGRADE)):
             warnungen.append("Erstes Update fehlgeschlagen.")
     else:
         warnungen.append("Kein Internet im Container (Netzwerk, VLAN, DNS prüfen) – erstes Update übersprungen.")

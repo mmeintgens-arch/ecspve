@@ -92,7 +92,7 @@ class Pruefskript(unittest.TestCase):
                          [[f"{ORDNER}/opt/ecswebsite/pve-install.sh", "--pull", "--update", "--ctid=101"]])
         # ohne Wrapper auf dem Host: Update im Container
         self.assertEqual(helfer.app_update_befehle(102, ["turnierapp"], konf),
-                         [["pct", "exec", "102", "--", "turnierapp-update"]])
+                         [["pct", "exec", "102", "--", "env", f"PATH={helfer.PFAD}", "turnierapp-update"]])
         self.assertIsNone(helfer.app_update_befehle(105, ["streetworkdoc"], konf))
         self.assertEqual(helfer.app_update_befehle(130, [], {"UPDATE_130": "mein-update {id}"}),
                          [["bash", "-c", "mein-update 130"]])

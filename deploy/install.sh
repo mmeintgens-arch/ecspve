@@ -18,6 +18,9 @@ say() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mHinweis:\033[0m %s\n' "$*"; }
 die() { printf '\n\033[1;31mFehler:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# pct exec gibt nur /sbin:/bin:/usr/sbin:/usr/bin mit – /usr/local gehört aber dazu (dort liegt ecspve)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 ENV_FILE=/etc/ecspve/ecspve.env
 SSH_DIR=/etc/ecspve/ssh
@@ -98,7 +101,7 @@ systemctl enable --quiet ecspve.service ecspve-nacht.timer
 systemctl restart ecspve.service
 systemctl start ecspve-nacht.timer
 
-for _ in $(seq 1 20); do ecspve ping >/dev/null 2>&1 && break; sleep 1; done
-ecspve ping >/dev/null 2>&1 || die "Die Weboberfläche startet nicht – Protokoll: journalctl -u ecspve -n 50"
+for _ in $(seq 1 20); do /usr/local/bin/ecspve ping >/dev/null 2>&1 && break; sleep 1; done
+/usr/local/bin/ecspve ping >/dev/null 2>&1 || die "Die Weboberfläche startet nicht – Protokoll: journalctl -u ecspve -n 50"
 [ -f /etc/ecspve/passwort ] || warn "Noch kein Passwort gesetzt – im Container: ecspve passwort"
 echo "Weboberfläche läuft (Port $(sed -n 's/^PORT=//p' "$ENV_FILE" | tail -n1))."

@@ -1,6 +1,8 @@
 #!/bin/sh
 # Befehle der Übersicht (ecspve --help). Passwort und Token setzt root, alles andere läuft als Benutzer ecspve –
 # so nutzt es denselben SSH-Schlüssel und dieselbe Verbindung wie der Dienst.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 case "${1:-}" in
   passwort | token) exec /usr/bin/python3 /opt/ecspve/ecspve.py "$@" ;;
 esac

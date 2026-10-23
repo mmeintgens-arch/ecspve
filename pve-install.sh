@@ -134,7 +134,8 @@ fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-pct_exec() { pct exec "$CTID" -- "$@"; }
+# pct gibt im Container nur /sbin:/bin:/usr/sbin:/usr/bin mit – ohne /usr/local, wo ecspve liegt
+pct_exec() { pct exec "$CTID" -- env PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"; }
 
 # Passwort der Weboberfläche: angegeben, vom abgebrochenen ersten Versuch übernommen, abgefragt oder zufällig
 PW_DATEI=''
