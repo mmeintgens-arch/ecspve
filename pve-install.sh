@@ -136,16 +136,11 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 pct_exec() { pct exec "$CTID" -- "$@"; }
 
-# --- Container anlegen ---------------------------------------------------------------------------------------
-if (( ! UPDATE )); then
-  CTID=${CTID:-$(pvesh get /cluster/nextid)}
-  pct status "$CTID" >/dev/null 2>&1 && die "Container $CTID gibt es schon."
-  if [ -z "$STORAGE" ]; then
-    STORAGE=$(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3 == "active" {print $1; exit}')
-    STORAGE=${STORAGE:-local-lvm}
-  fi
-
-  # Passwort der Weboberfläche: angegeben, abgefragt oder zufällig
+# Passwort der Weboberfläche: angegeben, vom abgebrochenen ersten Versuch übernommen, abgefragt oder zufällig
+PW_DATEI=''
+passwort_festlegen() {
+  local datei="/root/ecspve-ct$CTID-passwort.txt"
+  [ -n "$PASSWORD" ] || [ ! -f "$datei" ] || PASSWORD=$(sed -n 's/^Passwort: //p' "$datei" | head -n1)
   if [ -z "$PASSWORD" ] && [ -t 0 ]; then
     read -rsp "Passwort für die Übersicht (mind. 12 Zeichen, leer = zufällig): " PASSWORD; echo
     if [ -n "$PASSWORD" ]; then
@@ -155,6 +150,24 @@ if (( ! UPDATE )); then
   fi
   [ -n "$PASSWORD" ] || PASSWORD=$(tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 20 || true)
   [ "${#PASSWORD}" -ge 12 ] || die "Das Passwort muss mindestens 12 Zeichen lang sein."
+  ( umask 077
+    printf 'Übersicht (ecspve), Container %s\nPasswort: %s\nGesetzt:  %s\n' \
+      "$CTID" "$PASSWORD" "$(date '+%d.%m.%Y %H:%M')" >"$datei" )
+  printf '%s\n' "$PASSWORD" >"$TMP/pw"
+  chmod 600 "$TMP/pw"
+  PW_DATEI=$datei
+}
+
+# --- Container anlegen ---------------------------------------------------------------------------------------
+if (( ! UPDATE )); then
+  CTID=${CTID:-$(pvesh get /cluster/nextid)}
+  pct status "$CTID" >/dev/null 2>&1 && die "Container $CTID gibt es schon."
+  if [ -z "$STORAGE" ]; then
+    STORAGE=$(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 && $3 == "active" {print $1; exit}')
+    STORAGE=${STORAGE:-local-lvm}
+  fi
+
+  passwort_festlegen
 
   say "Debian-Vorlage suchen"
   pveam update >/dev/null 2>&1 || true
@@ -175,11 +188,6 @@ if (( ! UPDATE )); then
     --unprivileged 1 --features nesting=1 --onboot "$ONBOOT" --ostype debian --timezone host \
     --tags "$TAG" --description "$NOTES" >/dev/null
   pct start "$CTID"
-  ( umask 077
-    printf 'Übersicht (ecspve), Container %s\nPasswort: %s\nGesetzt:  %s\n' \
-      "$CTID" "$PASSWORD" "$(date '+%d.%m.%Y %H:%M')" >"/root/ecspve-ct$CTID-passwort.txt" )
-  printf '%s\n' "$PASSWORD" >"$TMP/pw"
-  chmod 600 "$TMP/pw"
 fi
 
 pct status "$CTID" | grep -q running || { pct start "$CTID"; sleep 3; }
@@ -187,6 +195,12 @@ pct status "$CTID" | grep -q running || { pct start "$CTID"; sleep 3; }
 say "Auf Netzwerk im Container warten"
 for _ in $(seq 1 60); do pct_exec getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
 pct_exec getent hosts deb.debian.org >/dev/null 2>&1 || die "Container $CTID erreicht das Internet nicht (Netzwerk/VLAN/DNS prüfen: pct enter $CTID)."
+
+# Brach eine frühere Installation nach dem Anlegen ab, fehlt im Container noch das Passwort
+if (( UPDATE )) && ! pct_exec test -f /etc/ecspve/passwort; then
+  say "Im Container ist noch kein Passwort gesetzt (frühere Installation abgebrochen?)"
+  passwort_festlegen
+fi
 
 # --- Adresse des Hosts aus Sicht des Containers ------------------------------------------------------------------
 NET0=$(pct config "$CTID" | sed -n 's/^net0: //p')
@@ -248,8 +262,10 @@ PORT_CT=$(pct_exec sed -n 's/^PORT=//p' /etc/ecspve/ecspve.env | tail -n1)
 CT_ADDR=${CT_IP:-$(pct_exec hostname -I | awk '{print $1}')}
 say "Fertig – Container $CTID"
 echo "  Weboberfläche: http://$CT_ADDR:$PORT_CT  (nur HTTP – im Caddy davor: reverse_proxy $CT_ADDR:$PORT_CT)"
-(( UPDATE )) || echo "  Passwort:      /root/ecspve-ct$CTID-passwort.txt (nur für root lesbar)"
-(( UPDATE )) || echo "  Erste Anmeldung: Passwort, dann zweiten Faktor mit einer Authenticator-App einrichten."
+if [ -n "$PW_DATEI" ]; then
+  echo "  Passwort:      $PW_DATEI (nur für root lesbar)"
+  echo "  Erste Anmeldung: Passwort, dann zweiten Faktor mit einer Authenticator-App einrichten."
+fi
 pct_exec grep -q '^PROXY_IP=.' /etc/ecspve/ecspve.env ||
   warn "Kein --proxy-ip gesetzt: Die Übersicht ist auch direkt über HTTP erreichbar. Empfohlen: $SRC/pve-install.sh --proxy-ip=<IP eures Caddy> – dann nur noch über den Proxy mit HTTPS."
 [ -n "$CT_IP" ] || warn "Der Container hat DHCP – der SSH-Schlüssel gilt deshalb von jeder Adresse. Mit fester IP (--ip=… beim Anlegen) ist er zusätzlich auf diese Adresse beschränkt."
