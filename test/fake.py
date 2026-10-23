@@ -365,12 +365,23 @@ if __name__ == "__main__":
         os.environ.update(env)
         sys.path.insert(0, str(PROJEKT))
         import ecspve
-        (ziel / "conf" / "passwort").write_text(ecspve.passwort_hash("demo-passwort") + "\n")
-        if "--erstanmeldung" not in sys.argv:
-            # Zweiter Faktor mit festem Schlüssel – Code z. B.: python3 -c "import ecspve,time; print(ecspve.totp(…))"
-            ecspve.zf_speichern({"geheim": DEMO_GEHEIM, "seit": time.time() - 86400 * 3, "letzter_schritt": 0,
-                                 "notfall": [ecspve.notfall_hash(c) for c in ("demo2demo2", "demo3demo3", "demo4demo4")]})
-            print(f"Demo: Passwort demo-passwort, Schlüssel für die Authenticator-App {DEMO_GEHEIM}", flush=True)
+        # Benutzer der Vorschau: admin (Passwort demo-passwort) und zwei weitere
+        hash_ = ecspve.passwort_hash("demo-passwort")
+        jetzt = time.time()
+        zf = None if "--erstanmeldung" in sys.argv else {
+            "geheim": DEMO_GEHEIM, "seit": jetzt - 86400 * 3, "letzter_schritt": 0,
+            "notfall": [ecspve.notfall_hash(c) for c in ("demo2demo2", "demo3demo3", "demo4demo4")]}
+        with ecspve.benutzer_aendern() as d:
+            d["benutzer"] = {
+                "admin": {"rolle": "admin", "hash": hash_, "aktiv": True, "erstellt": jetzt - 86400 * 9,
+                          "muss_aendern": False, "zf": zf, "letzte_anmeldung": jetzt - 3600},
+                "max.muster": {"rolle": "bedienen", "hash": hash_, "aktiv": True, "erstellt": jetzt - 86400 * 2,
+                               "muss_aendern": False, "zf": dict(zf or {}, notfall=[]) or None,
+                               "letzte_anmeldung": jetzt - 86400},
+                "kasse": {"rolle": "lesen", "hash": hash_, "aktiv": True, "erstellt": jetzt - 600,
+                          "muss_aendern": True, "zf": None},
+            }
+        print(f"Demo: Benutzer admin, max.muster, kasse – Passwort demo-passwort, App-Schlüssel {DEMO_GEHEIM}", flush=True)
         ecspve.serve()
     else:
         for k, v in env.items():

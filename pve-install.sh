@@ -9,7 +9,7 @@
 #   /opt/ecspve/pve-install.sh --ip=192.168.10.60/24 --gw=192.168.10.1 --proxy-ip=192.168.10.2
 #   --ctid=N  --hostname=NAME (ecspve)  --storage=NAME (erster mit „rootdir“)  --tmpl-storage=NAME (local)
 #   --cores=N (1)  --memory=MB (512)  --disk=GB (4)  --bridge=NAME (vmbr0)  --vlan=N  --no-onboot
-#   --ip=dhcp|CIDR (dhcp)  --gw=IP  --password=PW (Weboberfläche; sonst Abfrage bzw. zufällig, gespeichert
+#   --ip=dhcp|CIDR (dhcp)  --gw=IP  --password=PW (Benutzer „admin“; sonst Abfrage bzw. zufällig, gespeichert
 #   auf dem Host in /root/ecspve-ct<ID>-passwort.txt)
 #
 # Einstellungen der Übersicht (beim Anlegen und bei Updates):
@@ -152,7 +152,7 @@ passwort_festlegen() {
   [ -n "$PASSWORD" ] || PASSWORD=$(tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 20 || true)
   [ "${#PASSWORD}" -ge 12 ] || die "Das Passwort muss mindestens 12 Zeichen lang sein."
   ( umask 077
-    printf 'Übersicht (ecspve), Container %s\nPasswort: %s\nGesetzt:  %s\n' \
+    printf 'Übersicht (ecspve), Container %s\nBenutzer: admin\nPasswort: %s\nGesetzt:  %s\n' \
       "$CTID" "$PASSWORD" "$(date '+%d.%m.%Y %H:%M')" >"$datei" )
   printf '%s\n' "$PASSWORD" >"$TMP/pw"
   chmod 600 "$TMP/pw"
@@ -198,7 +198,7 @@ for _ in $(seq 1 60); do pct_exec getent hosts deb.debian.org >/dev/null 2>&1 &&
 pct_exec getent hosts deb.debian.org >/dev/null 2>&1 || die "Container $CTID erreicht das Internet nicht (Netzwerk/VLAN/DNS prüfen: pct enter $CTID)."
 
 # Brach eine frühere Installation nach dem Anlegen ab, fehlt im Container noch das Passwort
-if (( UPDATE )) && ! pct_exec test -f /etc/ecspve/passwort; then
+if (( UPDATE )) && ! pct_exec sh -c 'grep -qs "\"hash\"" /var/lib/ecspve/benutzer.json || test -s /etc/ecspve/passwort'; then
   say "Im Container ist noch kein Passwort gesetzt (frühere Installation abgebrochen?)"
   passwort_festlegen
 fi
@@ -264,8 +264,9 @@ CT_ADDR=${CT_IP:-$(pct_exec hostname -I | awk '{print $1}')}
 say "Fertig – Container $CTID"
 echo "  Weboberfläche: http://$CT_ADDR:$PORT_CT  (nur HTTP – im Caddy davor: reverse_proxy $CT_ADDR:$PORT_CT)"
 if [ -n "$PW_DATEI" ]; then
-  echo "  Passwort:      $PW_DATEI (nur für root lesbar)"
-  echo "  Erste Anmeldung: Passwort, dann zweiten Faktor mit einer Authenticator-App einrichten."
+  echo "  Anmelden:      Benutzer admin, Passwort in $PW_DATEI (nur für root lesbar)"
+  echo "  Erste Anmeldung: danach den zweiten Faktor mit einer Authenticator-App einrichten."
+  echo "  Weitere Benutzer legt ein Admin auf der Seite unter „Benutzer“ an."
 fi
 pct_exec grep -q '^PROXY_IP=.' /etc/ecspve/ecspve.env ||
   warn "Kein --proxy-ip gesetzt: Die Übersicht ist auch direkt über HTTP erreichbar. Empfohlen: $SRC/pve-install.sh --proxy-ip=<IP eures Caddy> – dann nur noch über den Proxy mit HTTPS."

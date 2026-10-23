@@ -20,6 +20,7 @@
   </div>
   <div class="kopf-rechts">
     <span id="gesamt" class="pille" hidden></span>
+    <span id="wer" class="leise-text" hidden></span>
     <button id="abmelden" class="leise" type="button" hidden>Abmelden</button>
   </div>
 </header>
@@ -57,6 +58,13 @@
     <h2>Sicherheit</h2>
     <div id="sicherheit"></div>
   </section>
+  <section class="karte" id="benutzer-karte" hidden>
+    <div class="abschnitt-kopf">
+      <h2>Benutzer</h2>
+      <button id="benutzer-neu" type="button" class="haupt">Benutzer anlegen</button>
+    </div>
+    <div id="benutzer"></div>
+  </section>
 </main>
 
 <section id="anmeldung" class="anmeldung" hidden>
@@ -66,9 +74,22 @@
     <p class="leise-text">Übersicht der Container und Dienste</p>
 
     <form id="anmeldeform">
+      <label for="benutzername">Benutzername</label>
+      <input id="benutzername" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required>
       <label for="passwort">Passwort</label>
       <input id="passwort" type="password" autocomplete="current-password" required>
       <button type="submit" class="haupt">Weiter</button>
+    </form>
+
+    <form id="neupwform" hidden>
+      <h2>Eigenes Passwort festlegen</h2>
+      <p>Du hast ein Startpasswort bekommen. Bitte ersetze es jetzt durch ein eigenes – mindestens 12 Zeichen,
+        am besten aus dem Passwort-Manager.</p>
+      <label for="neupw1">Neues Passwort</label>
+      <input id="neupw1" type="password" autocomplete="new-password" minlength="12" required>
+      <label for="neupw2">Wiederholen</label>
+      <input id="neupw2" type="password" autocomplete="new-password" minlength="12" required>
+      <button type="submit" class="haupt">Speichern</button>
     </form>
 
     <form id="codeform" hidden>
@@ -84,7 +105,7 @@
       <p>Zur Sicherheit braucht die Anmeldung neben dem Passwort einen Code vom Handy. Einmalig einrichten:</p>
       <ol class="schritte">
         <li>Eine Authenticator-App öffnen – z. B. Microsoft Authenticator, Google Authenticator, Aegis oder 2FAS.</li>
-        <li>Den QR-Code scannen. Mehrere Leute im Team? Alle scannen jetzt denselben Code.</li>
+        <li>Den QR-Code scannen – jeder Benutzer hat seinen eigenen.</li>
         <li>Den 6-stelligen Code aus der App unten eintragen.</li>
       </ol>
       <div class="qr"><img id="einrichten-qr" alt="QR-Code für die Authenticator-App" width="220" height="220" hidden></div>
@@ -212,6 +233,74 @@
     </div>
   </form>
 </dialog>
+<dialog id="benutzer-dialog">
+  <form id="benutzer-form" novalidate>
+    <div class="dialog-kopf">
+      <h2 id="benutzer-titel">Benutzer anlegen</h2>
+      <button type="button" class="leise" data-schliessen>Schließen</button>
+    </div>
+    <div class="formular">
+      <div id="benutzer-eingabe" class="felder">
+        <label>Benutzername <input name="name" maxlength="64" placeholder="z. B. max.muster" autocapitalize="none"
+          spellcheck="false" autocomplete="off"></label>
+        <label>Rolle
+          <select name="rolle">
+            <option value="lesen">Nur ansehen</option>
+            <option value="bedienen" selected>Bedienen – Neustarts, Updates, Container anlegen</option>
+            <option value="admin">Admin – dazu Benutzer verwalten</option>
+          </select>
+        </label>
+      </div>
+      <div id="benutzer-ergebnis"></div>
+      <p class="fehlertext" id="benutzer-fehler" role="alert"></p>
+    </div>
+    <div class="dialog-fuss">
+      <button type="button" data-schliessen>Schließen</button>
+      <button type="submit" class="haupt" id="benutzer-knopf">Anlegen</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="freigabe-dialog">
+  <form id="freigabe-form" novalidate>
+    <div class="dialog-kopf">
+      <h2>Benutzerverwaltung freischalten</h2>
+      <button type="button" class="leise" data-schliessen>Abbrechen</button>
+    </div>
+    <div class="formular">
+      <p>Zum Schutz bitte einmal den aktuellen Code aus deiner App eingeben – danach geht es 10 Minuten ohne.</p>
+      <label class="feld">Code aus der App (oder ein Notfallcode)
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="11" spellcheck="false">
+      </label>
+      <p class="fehlertext" id="freigabe-fehler" role="alert"></p>
+    </div>
+    <div class="dialog-fuss">
+      <button type="button" data-schliessen>Abbrechen</button>
+      <button type="submit" class="haupt">Freischalten</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="konto-dialog">
+  <form id="konto-form" novalidate>
+    <div class="dialog-kopf">
+      <h2>Eigenes Passwort ändern</h2>
+      <button type="button" class="leise" data-schliessen>Abbrechen</button>
+    </div>
+    <div class="formular">
+      <label class="feld">Bisheriges Passwort <input name="alt" type="password" autocomplete="current-password"></label>
+      <label class="feld">Neues Passwort (mind. 12 Zeichen) <input name="neu" type="password" autocomplete="new-password"></label>
+      <label class="feld">Neues Passwort wiederholen <input name="neu2" type="password" autocomplete="new-password"></label>
+      <p class="leise-text">Alle anderen Browser, in denen du angemeldet bist, werden dabei abgemeldet.</p>
+      <p class="fehlertext" id="konto-fehler" role="alert"></p>
+    </div>
+    <div class="dialog-fuss">
+      <button type="button" data-schliessen>Abbrechen</button>
+      <button type="submit" class="haupt">Ändern</button>
+    </div>
+  </form>
+</dialog>
+
 <div id="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

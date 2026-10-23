@@ -5,6 +5,7 @@
   const WAS = { alles: "System und App", system: "Betriebssystem", app: "App" };
   const STATUS = { ok: "erfolgreich", warnung: "mit Warnung", fehler: "fehlgeschlagen", laeuft: "läuft", wartet: "wartet" };
   const ZEICHEN = { ok: "✔", warnung: "⚠", fehler: "✘", laeuft: "⟳", wartet: "…" };
+  const RANG = { lesen: 0, bedienen: 1, admin: 2 };
 
   let stand = null;
   let timer = null;
@@ -73,9 +74,15 @@
       zeigeAnmeldung();
       throw new Error("Bitte anmelden.");
     }
-    if (!r.ok) throw new Error((json && json.fehler) || `Fehler ${r.status}`);
+    if (!r.ok) {
+      const fehler = new Error((json && json.fehler) || `Fehler ${r.status}`);
+      fehler.daten = json || {};
+      throw fehler;
+    }
     return json;
   }
+  // Was die eigene Rolle erlaubt – der Server prüft es ohnehin, hier geht es nur ums Anzeigen
+  const darf = (rolle) => Boolean(stand && stand.ich) && RANG[stand.ich.rolle] >= RANG[rolle];
   function gastName(id) {
     const g = stand && stand.gaeste.find((x) => x.id === id);
     return g ? g.name : `#${id}`;
@@ -109,12 +116,18 @@
     timer = setTimeout(laden, laeuft ? 4000 : 10000);
   }
   function anmeldeSchritt(name) {
-    for (const [id, schritt] of [["anmeldeform", "passwort"], ["codeform", "code"], ["einrichten", "einrichten"], ["notfall", "notfall"]]) {
+    for (const [id, schritt] of [["anmeldeform", "passwort"], ["neupwform", "neues-passwort"], ["codeform", "code"],
+      ["einrichten", "einrichten"], ["notfall", "notfall"]]) {
       $(id).hidden = schritt !== name;
     }
     $("anmeldefehler").textContent = "";
-    const fokus = { passwort: "passwort", code: "code", einrichten: "einrichten-code" }[name];
+    const fokus = { passwort: "benutzername", "neues-passwort": "neupw1", code: "code", einrichten: "einrichten-code" }[name];
     if (fokus) { $(fokus).value = ""; $(fokus).focus(); }
+    if (name === "neues-passwort") $("neupw2").value = "";
+  }
+  function weiterNach(schritt) {
+    if (schritt === "einrichten") einrichtenStarten();
+    else anmeldeSchritt(schritt);
   }
   async function zeigeAnmeldung() {
     clearTimeout(timer);
@@ -122,12 +135,12 @@
     $("inhalt").hidden = true;
     $("gesamt").hidden = true;
     $("abmelden").hidden = true;
+    $("wer").hidden = true;
     $("anmeldung").hidden = false;
     // Nach dem Neuladen im richtigen Schritt weitermachen
     let s = { stufe: null };
     try { s = await api("/api/sitzung"); } catch (e) { /* dann eben beim Passwort */ }
-    if (s.stufe === "passwort" && s.zwei_faktor) anmeldeSchritt("code");
-    else if (s.stufe === "passwort") einrichtenStarten();
+    if (s.stufe === "passwort" && s.schritt) weiterNach(s.schritt);
     else anmeldeSchritt("passwort");
   }
   function qrBlock(d) {
@@ -162,6 +175,10 @@
     $("inhalt").hidden = false;
     $("abmelden").hidden = false;
     $("gesamt").hidden = false;
+    if (stand && stand.ich) {
+      $("wer").hidden = false;
+      $("wer").textContent = `${stand.ich.name} · ${stand.ich.rollen[stand.ich.rolle] || stand.ich.rolle}`;
+    }
   }
 
   // --- Zeichnen ------------------------------------------------------------------------------------
@@ -187,6 +204,9 @@
     nachtKarte();
     schnittstellen();
     sicherheitKarte();
+    benutzerKarte();
+    $("alle").hidden = !darf("bedienen");
+    $("anlegen").hidden = !darf("bedienen");
   }
 
   function meldungen() {
@@ -223,16 +243,149 @@
         h("button", { type: "button", onclick: () => zfOeffnen("geraet") }, "Weiteres Handy hinzufügen"),
         h("button", { type: "button", onclick: () => zfOeffnen("notfallcodes") }, "Neue Notfallcodes"),
         h("button", { type: "button", onclick: () => zfOeffnen("neu") }, "Neues Handy einrichten"),
+        h("button", { type: "button", onclick: kontoOeffnen }, "Passwort ändern"),
         h("button", { type: "button", disabled: s.sitzungen < 2, onclick: andereAbmelden }, "Alle anderen abmelden")),
       h("h3", { class: "abstand" }, "Letzte Ereignisse"),
       s.ereignisse.length ? h("ul", { class: "ereignisse" }, s.ereignisse.map((e) =>
         h("li", { class: e.ok ? "" : "schlecht" }, h("span", { class: "leise-text" }, zeit(e.zeit)),
-          h("span", { class: "mono" }, e.ip), h("span", {}, e.text)))) : h("p", { class: "leer" }, "Noch keine."));
+          h("span", { class: "mono" }, e.ip), h("span", {}, e.wer ? h("strong", {}, `${e.wer}: `) : null, e.text))))
+        : h("p", { class: "leer" }, "Noch keine."));
   }
   async function andereAbmelden() {
     if (!confirm("Alle anderen angemeldeten Browser abmelden?")) return;
     try { await api("/api/sitzungen/beenden", {}); toast("Alle anderen Sitzungen sind abgemeldet"); laden(); }
     catch (e) { toast(e.message); }
+  }
+
+  // --- Benutzer (nur Admins) -----------------------------------------------------------------------
+  function benutzerKarte() {
+    const karte = $("benutzer-karte");
+    karte.hidden = !stand.benutzer;
+    if (!stand.benutzer) return;
+    // Nicht unter der Hand neu zeichnen, während jemand in der Tabelle etwas auswählt
+    if ($("benutzer").contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+    const datum = (ts) => (ts ? zeit(ts) : "nie");
+    const zeilen = stand.benutzer.map((b) => {
+      const ich = b.name === stand.ich.name;
+      const rolle = h("select", { "aria-label": `Rolle von ${b.name}`, disabled: ich },
+        Object.entries(stand.ich.rollen).map(([k, v]) => h("option", { value: k, selected: k === b.rolle }, v)));
+      rolle.addEventListener("change", () => adminAktion("/api/benutzer/aendern", { name: b.name, rolle: rolle.value },
+        `${b.name}: ${stand.ich.rollen[rolle.value]}`));
+      const status = [b.aktiv ? null : h("span", { class: "marke-klein gesperrt" }, "gesperrt"),
+        ich ? h("span", { class: "marke-klein ich" }, "du") : null,
+        b.muss_aendern ? h("span", { class: "marke-klein" }, "Startpasswort") : null];
+      const mehr = ich ? null : menue("…", [
+        ["Passwort zurücksetzen", () => adminAktion("/api/benutzer/passwort", { name: b.name }, null,
+          `Neues Startpasswort für „${b.name}“? Alle Sitzungen von „${b.name}“ werden abgemeldet.`)],
+        ["Zweiten Faktor zurücksetzen", () => adminAktion("/api/benutzer/zwei-faktor", { name: b.name },
+          `${b.name} richtet bei der nächsten Anmeldung eine neue App ein`,
+          `Zweiten Faktor von „${b.name}“ zurücksetzen (z. B. Handy verloren)? „${b.name}“ wird abgemeldet und richtet bei der nächsten Anmeldung eine neue App ein.`)],
+        [b.aktiv ? "Sperren" : "Entsperren", () => adminAktion("/api/benutzer/aendern", { name: b.name, aktiv: !b.aktiv },
+          `${b.name} ${b.aktiv ? "gesperrt" : "entsperrt"}`, b.aktiv ? `„${b.name}“ sperren? Alle Sitzungen werden sofort beendet.` : null)],
+        ["Löschen", () => adminAktion("/api/benutzer/loeschen", { name: b.name }, `${b.name} gelöscht`,
+          `Benutzer „${b.name}“ endgültig löschen?`)],
+      ]);
+      return h("tr", {}, h("td", {}, h("strong", {}, b.name), " ", status), h("td", {}, rolle),
+        h("td", { class: b.zwei_faktor ? "gut" : "mittel" }, b.zwei_faktor ? `✔ (${b.notfall_uebrig} Notfallcodes)` : "noch nicht eingerichtet"),
+        h("td", { class: "leise-text" }, datum(b.letzte_anmeldung)), h("td", {}, mehr));
+    });
+    $("benutzer").replaceChildren(h("div", { class: "tabelle-rahmen" }, h("table", { class: "benutzer" },
+      h("thead", {}, h("tr", {}, ["Benutzer", "Rolle", "Zweiter Faktor", "Zuletzt angemeldet", ""].map((t) => h("th", {}, t)))),
+      h("tbody", {}, zeilen))),
+    h("p", { class: "leise-text abstand" }, "Admin: alles, dazu Benutzer verwalten · Bedienen: Neustarts, Updates, Container anlegen · Nur ansehen: keine Aktionen. Neue Benutzer ersetzen ihr Startpasswort bei der ersten Anmeldung und richten ihren eigenen zweiten Faktor ein."));
+  }
+
+  // Benutzer verwalten braucht einen frisch bestätigten Code – fehlt er, einmal fragen und dann wiederholen
+  function codeFreigabe() {
+    return new Promise((fertig) => {
+      const d = $("freigabe-dialog");
+      const f = $("freigabe-form");
+      f.elements.code.value = "";
+      $("freigabe-fehler").textContent = "";
+      f.onsubmit = async (ev) => {
+        ev.preventDefault();
+        try {
+          await api("/api/benutzer/freigabe", { code: f.elements.code.value });
+          d.onclose = null;
+          d.close();
+          fertig(true);
+        } catch (e) { $("freigabe-fehler").textContent = e.message; f.elements.code.select(); }
+      };
+      d.onclose = () => fertig(false);
+      d.showModal();
+      f.elements.code.focus();
+    });
+  }
+  async function mitFreigabe(pfad, daten) {
+    try {
+      return await api(pfad, daten);
+    } catch (e) {
+      if (!e.daten || !e.daten.code_noetig) throw e;
+      if (!(await codeFreigabe())) return null;
+      return api(pfad, daten);
+    }
+  }
+  async function adminAktion(pfad, daten, meldung, frage) {
+    if (frage && !confirm(frage)) { laden(); return; }
+    try {
+      const erg = await mitFreigabe(pfad, daten);
+      if (erg && erg.passwort) startpasswortZeigen(erg.name, erg.passwort, "Neues Startpasswort");
+      else if (erg && meldung) toast(meldung);
+    } catch (e) { toast(e.message); }
+    laden();
+  }
+  function startpasswortZeigen(name, passwort, titel) {
+    $("benutzer-titel").textContent = titel;
+    $("benutzer-eingabe").hidden = true;
+    $("benutzer-knopf").hidden = true;
+    $("benutzer-fehler").textContent = "";
+    $("benutzer-ergebnis").replaceChildren(h("div", { class: "startpasswort" },
+      h("p", {}, "Benutzer: ", h("strong", {}, name)),
+      h("p", {}, "Startpasswort: ", h("code", {}, passwort)),
+      h("p", { class: "leise-text" }, "Bitte sicher weitergeben (nicht per Mail). Es wird nur jetzt angezeigt. Bei der ersten Anmeldung wird es durch ein eigenes ersetzt, danach kommt der zweite Faktor."),
+      h("p", {}, h("button", { type: "button", onclick: () => kopieren(passwort) }, "Kopieren"))));
+    if (!$("benutzer-dialog").open) $("benutzer-dialog").showModal();
+  }
+  function benutzerNeuOeffnen() {
+    const f = $("benutzer-form");
+    f.reset();
+    $("benutzer-titel").textContent = "Benutzer anlegen";
+    $("benutzer-eingabe").hidden = false;
+    $("benutzer-knopf").hidden = false;
+    $("benutzer-ergebnis").replaceChildren();
+    $("benutzer-fehler").textContent = "";
+    $("benutzer-dialog").showModal();
+    f.elements.name.focus();
+  }
+  async function benutzerNeuAbschicken(ev) {
+    ev.preventDefault();
+    const f = $("benutzer-form");
+    $("benutzer-fehler").textContent = "";
+    try {
+      const erg = await mitFreigabe("/api/benutzer/anlegen", { name: f.elements.name.value.trim().toLowerCase(), rolle: f.elements.rolle.value });
+      if (erg) startpasswortZeigen(erg.name, erg.passwort, "Benutzer angelegt");
+      laden();
+    } catch (e) { $("benutzer-fehler").textContent = e.message; }
+  }
+
+  // --- Eigenes Passwort ------------------------------------------------------------------------------
+  function kontoOeffnen() {
+    const f = $("konto-form");
+    f.reset();
+    $("konto-fehler").textContent = "";
+    $("konto-dialog").showModal();
+    f.elements.alt.focus();
+  }
+  async function kontoAbschicken(ev) {
+    ev.preventDefault();
+    const f = $("konto-form");
+    if (f.elements.neu.value !== f.elements.neu2.value) { $("konto-fehler").textContent = "Die neuen Passwörter stimmen nicht überein."; return; }
+    try {
+      await api("/api/konto/passwort", { alt: f.elements.alt.value, neu: f.elements.neu.value });
+      $("konto-dialog").close();
+      toast("Passwort geändert – alle anderen Sitzungen sind abgemeldet");
+      laden();
+    } catch (e) { $("konto-fehler").textContent = e.message; }
   }
 
   // --- Zweiter Faktor verwalten ----------------------------------------------------------------------
@@ -332,7 +485,7 @@
           : h("span", { class: "gut" }, "✔ Host-Dienste laufen"),
         h("span", { class: "rechts" },
           hostJob ? h("button", { class: "leise", type: "button", onclick: () => protokoll(hostJob.id) }, "⟳ Update läuft – Protokoll")
-            : h("button", { type: "button", disabled: !host.updates, onclick: hostUpdate }, "Host aktualisieren"))));
+            : darf("bedienen") ? h("button", { type: "button", disabled: !host.updates, onclick: hostUpdate }, "Host aktualisieren") : null)));
   }
 
   function dienstChips(g) {
@@ -342,7 +495,7 @@
     const chips = sichtbar.map((d) => {
       const name = d.name.replace(/\.service$/, "");
       const titel = `${d.name}: ${d.text}`;
-      if (g.lokal && !g.auftrag && d.name.endsWith(".service")) {
+      if (g.lokal && !g.auftrag && d.name.endsWith(".service") && darf("bedienen")) {
         return h("button", { type: "button", class: `chip ${d.zustand}`, title: `${titel} – klicken zum Neustarten`,
           onclick: () => dienstNeustart(g, d.name) }, d.zustand === "fehler" ? `✘ ${name}` : name);
       }
@@ -363,7 +516,7 @@
         p.ok ? h("span", { class: "gut", title: p.detail }, `✔ antwortet${p.ms !== null ? ` (${p.ms} ms)` : ""}`)
           : h("span", { class: "schlecht" }, `✘ ${p.detail}`)]),
         g.pruefung_eigen ? h("span", { class: "leise-text", title: g.pruefung_eigen.wert }, " · eigene Prüfung") : null));
-    } else if (g.lokal) {
+    } else if (g.lokal && darf("bedienen")) {
       zeilen.push(h("dt", {}, "Funktion"), h("dd", {}, h("span", { class: "leise-text" }, "keine Prüfung · "),
         h("button", { type: "button", class: "leise", onclick: () => pruefungOeffnen(g) }, "festlegen")));
     }
@@ -393,6 +546,7 @@
     };
     const sys = h("input", { type: "checkbox", checked: g.auto.system });
     const app = h("input", { type: "checkbox", checked: g.auto.app, disabled: !appMoeglich && !g.auto.app });
+    if (!darf("bedienen")) { sys.disabled = true; app.disabled = true; }
     sys.addEventListener("change", () => aendern(sys.checked, app.checked));
     app.addEventListener("change", () => aendern(sys.checked, app.checked));
     return h("div", { class: "auto" }, h("span", {}, "Nachts automatisch:"),
@@ -411,6 +565,10 @@
   function aktionen(g) {
     if (!g.lokal) return h("div", { class: "aktionen leise-text" }, `Läuft auf Knoten ${g.knoten} – dort verwalten.`);
     const pveUrl = stand.schnittstellen && stand.schnittstellen.pve_url;
+    if (!darf("bedienen")) {
+      return h("div", { class: "aktionen" }, pveUrl ? h("a", { class: "rechts", href: `${pveUrl}/#v1:0:=${g.typ}%2F${g.id}`,
+        target: "_blank", rel: "noopener" }, "Proxmox ↗") : null);
+    }
     const frei = !g.auftrag;
     const laeuft = g.status === "running";
     const knoepfe = [];
@@ -498,7 +656,7 @@
         `Snapshot vor jedem Update: ${e.snapshots ? `ja, die letzten ${e.snapshots} bleiben` : "nein"} · `,
         `Neustart, wenn ein Update es verlangt: ${e.neustart ? "ja" : "nein"} · `,
         `Proxmox-Host nachts: ${n.host_auto ? "ja" : "nein"} – einstellbar in `, h("code", {}, "/etc/ecspve/ecspve.env")),
-      h("p", { class: "einstellungen" }, h("button", { type: "button", onclick: auffrischen }, "Paketlisten jetzt neu laden"))));
+      darf("bedienen") ? h("p", { class: "einstellungen" }, h("button", { type: "button", onclick: auffrischen }, "Paketlisten jetzt neu laden")) : null));
   }
 
   function kopierZeile(titel, wert, anzeige, text) {
@@ -686,11 +844,21 @@
       ev.preventDefault();
       $("anmeldefehler").textContent = "";
       try {
-        const d = await api("/api/anmelden", { passwort: $("passwort").value });
+        const d = await api("/api/anmelden", { benutzer: $("benutzername").value.trim().toLowerCase(), passwort: $("passwort").value });
         $("passwort").value = "";
-        if (d.schritt === "einrichten") einrichtenStarten();
-        else anmeldeSchritt("code");
+        weiterNach(d.schritt);
       } catch (e) { $("anmeldefehler").textContent = e.message; $("passwort").select(); }
+    });
+    $("neupwform").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      $("anmeldefehler").textContent = "";
+      if ($("neupw1").value !== $("neupw2").value) { $("anmeldefehler").textContent = "Die Passwörter stimmen nicht überein."; return; }
+      try {
+        weiterNach((await api("/api/anmelden/neues-passwort", { passwort: $("neupw1").value })).schritt);
+      } catch (e) {
+        $("anmeldefehler").textContent = e.message;
+        if (/Startpasswort anmelden/.test(e.message)) anmeldeSchritt("passwort");
+      }
     });
     $("codeform").addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -724,6 +892,9 @@
     });
     $("pruefen").addEventListener("click", () => auftrag("/api/pruefen", {}, "Prüfung läuft – Ergebnis in etwa einer Minute"));
     $("alle").addEventListener("click", alleAktualisieren);
+    $("benutzer-neu").addEventListener("click", benutzerNeuOeffnen);
+    $("benutzer-form").addEventListener("submit", benutzerNeuAbschicken);
+    $("konto-form").addEventListener("submit", kontoAbschicken);
     $("anlegen").addEventListener("click", anlegenOeffnen);
     $("anlegen-form").addEventListener("submit", anlegenAbschicken);
     $("pruefung-form").addEventListener("submit", pruefungAbschicken);

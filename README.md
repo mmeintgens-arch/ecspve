@@ -28,8 +28,8 @@ Schnittstellen für Monitoring-Werkzeuge und nächtliche automatische Updates.
 | Automatisch | Nachtlauf um 04:30 (nach den Sicherungen der Apps): je Container per Häkchen **System** und/oder **App**; Paketlisten überall auffrischen; Bericht auf der Seite und per Benachrichtigung | Karte „Automatische Updates“ |
 | Monitoring | `/health` (200/503), `/api/status` (JSON), `/metrics` (Prometheus), Push an ntfy, Heartbeat an Uptime Kuma/healthchecks.io | [Monitoring anbinden](#monitoring-anbinden) |
 
-Die Seite ist bewusst einfach: keine Benutzerverwaltung, ein Passwort, deutsch, hell und dunkel, auch am Handy
-bedienbar.
+Die Seite ist bewusst einfach: deutsch, hell und dunkel, auch am Handy bedienbar. Jede Person im Team bekommt einen
+eigenen Zugang mit eigenem zweiten Faktor und einer Rolle (siehe [Benutzer](#benutzer)).
 
 <img src="docs/mobil.png" alt="Ansicht am Handy" width="280">
 
@@ -146,10 +146,10 @@ status.eventcrew-steinfurt.de {
 Oder ohne Domain nur intern (`tls internal`). Ist `--proxy-ip` gesetzt, geht die Seite **nur** über diesen Caddy
 (direkt auf Port 8080 antworten nur noch `/health` und `/ping`), und die Anmeldung nur über HTTPS.
 
-**4. Erste Anmeldung mit zweitem Faktor.** `https://status…` öffnen, Passwort eingeben. Beim ersten Mal richtet die
-Seite den zweiten Faktor ein: QR-Code mit einer Authenticator-App scannen (Microsoft Authenticator, Google
-Authenticator, Aegis, 2FAS …), Code eintragen, die acht **Notfallcodes** sichern. Mehrere Leute im Team scannen
-denselben QR-Code – später geht das unter **Sicherheit → Weiteres Handy hinzufügen**.
+**4. Erste Anmeldung mit zweitem Faktor.** `https://status…` öffnen, als Benutzer **admin** mit dem Passwort aus
+`/root/ecspve-ct<ID>-passwort.txt` anmelden. Beim ersten Mal richtet die Seite den zweiten Faktor ein: QR-Code mit
+einer Authenticator-App scannen (Microsoft Authenticator, Google Authenticator, Aegis, 2FAS …), Code eintragen, die
+acht **Notfallcodes** sichern. Danach unter **Benutzer** für jede Person im Team einen eigenen Zugang anlegen.
 
 <img src="docs/zwei-faktor.png" alt="Zweiten Faktor einrichten" width="520">
 
@@ -269,9 +269,12 @@ Im Container der Übersicht:
 ```bash
 ecspve status          # dasselbe wie die Seite, als Liste
 ecspve verbindung      # erreicht der Container den Helfer auf dem Host?
-ecspve passwort        # Passwort der Weboberfläche neu setzen (meldet alle ab)
-ecspve zwei-faktor     # Stand des zweiten Faktors
-ecspve zwei-faktor zuruecksetzen   # Handy weg und keine Notfallcodes mehr: neue App bei der nächsten Anmeldung
+ecspve benutzer        # alle Benutzer mit Rolle, zweitem Faktor und letzter Anmeldung
+ecspve benutzer anlegen NAME --rolle=bedienen   # zeigt das Startpasswort
+ecspve benutzer passwort|zwei-faktor|sperren|entsperren|loeschen NAME
+ecspve benutzer rolle NAME admin|bedienen|lesen
+ecspve passwort        # Passwort von „admin“ neu setzen (meldet admin überall ab)
+ecspve zwei-faktor zuruecksetzen NAME   # Handy weg und keine Notfallcodes mehr: neue App bei der nächsten Anmeldung
 ecspve token --neu     # neues Token für Monitoring
 journalctl -u ecspve -f
 ```
@@ -297,19 +300,47 @@ Passwort, Token und Auswahl bleiben. Mit dem Häkchen **App** in der Karte der �
 
 Die Seite kann Container anlegen, neu starten und Updates anstoßen. Deshalb ist sie mehrfach abgesichert:
 
-**Anmeldung mit zweitem Faktor**
-- Passwort (mindestens 12 Zeichen, PBKDF2 mit 600 000 Runden) **und** ein Code aus einer Authenticator-App (TOTP nach
-  RFC 6238, 6 Ziffern, 30 Sekunden). Ohne Code gibt es keine Daten und keine Aktionen.
+### Benutzer
+
+Jede Person bekommt einen eigenen Zugang – mit eigenem Passwort, eigenem zweiten Faktor und einer Rolle:
+
+![Benutzer verwalten](docs/benutzer.png)
+
+| Rolle | darf |
+|---|---|
+| **Admin** | alles, dazu Benutzer verwalten |
+| **Bedienen** | Neustarts, Dienste neu starten, Updates, „Nachts automatisch“, Container anlegen, Funktionsprüfungen |
+| **Nur ansehen** | alles sehen, nichts auslösen (das Root-Passwort neuer Container sieht diese Rolle nicht) |
+
+- Ein Admin legt Benutzer unter **Benutzer → Benutzer anlegen** an (oder im Container `ecspve benutzer anlegen NAME
+  --rolle=…`). Die Seite zeigt ein **Startpasswort** – einmal, zum sicheren Weitergeben. Bei der ersten Anmeldung
+  ersetzt die Person es durch ein eigenes und richtet ihren eigenen zweiten Faktor ein.
+- In der Tabelle: Rolle ändern (wirkt sofort), **Passwort zurücksetzen** (neues Startpasswort), **Zweiten Faktor
+  zurücksetzen** (Handy verloren), **Sperren** (meldet sofort überall ab), **Löschen**.
+- Benutzer verwalten geht nur mit frisch bestätigtem Code des Admins (gilt dann 10 Minuten) – ein offen gelassener
+  Browser reicht dafür nicht. Den eigenen Zugang kann man dort nicht herabstufen oder sperren, und es bleibt immer
+  mindestens ein aktiver Admin.
+- Admins sehen im Sicherheitsprotokoll alle Einträge, alle anderen nur ihre eigenen. Jede Aktion steht mit Namen drin.
+- Der bisherige einzelne Zugang (vor der Benutzerverwaltung) wird beim ersten Start automatisch zum Benutzer
+  **admin** – mit demselben Passwort und derselben Authenticator-App.
+
+### Anmeldung mit zweitem Faktor
+
+- Benutzername, Passwort (mindestens 12 Zeichen, PBKDF2 mit 600 000 Runden) **und** ein Code aus einer
+  Authenticator-App (TOTP nach RFC 6238, 6 Ziffern, 30 Sekunden). Ohne Code gibt es keine Daten und keine Aktionen.
+  Ob es einen Benutzernamen gibt, verrät die Anmeldung nicht.
 - Jeder Code gilt bei der Anmeldung nur **einmal** – wer ihn mitliest, kann ihn nicht wiederverwenden.
 - Acht **Notfallcodes** für den Fall, dass das Handy weg ist – jeder nur einmal, gespeichert nur als Hash. Neue unter
-  **Sicherheit → Neue Notfallcodes**. Ist alles weg: im Container `ecspve zwei-faktor zuruecksetzen`.
-- **Neues Handy einrichten** (nach Verlust) meldet alle anderen Handys und Sitzungen ab. Ein neues Passwort
-  (`ecspve passwort`) ebenso.
-- Das Geheimnis der App liegt nur im Container (`/var/lib/ecspve/zwei-faktor.json`, nur für den Dienst lesbar).
+  **Sicherheit → Neue Notfallcodes**. Ist alles weg: ein Admin setzt den zweiten Faktor zurück (oder im Container
+  `ecspve zwei-faktor zuruecksetzen NAME`).
+- **Neues Handy einrichten** (nach Verlust) meldet alle anderen Handys und Sitzungen dieses Benutzers ab. Ein neues
+  Passwort (**Sicherheit → Passwort ändern**) ebenso.
+- Passwort-Hashes und App-Geheimnisse liegen nur im Container (`/var/lib/ecspve/benutzer.json`, nur für den Dienst
+  lesbar).
 - Bis zur ersten Anmeldung ist der zweite Faktor noch nicht eingerichtet – wer bis dahin das Passwort kennt, könnte
   seine eigene App eintragen. Deshalb gleich nach der Installation anmelden und einrichten.
 
-**Gegen Durchprobieren**
+### Gegen Durchprobieren
 - 5 Fehlversuche (Passwort, Code oder Monitoring-Token) von einer Adresse: diese Adresse 15 Minuten gesperrt.
   30 Fehlversuche von verschiedenen Adressen: Anmeldung für alle 15 Minuten gesperrt. Jeder Fehlversuch kostet
   zusätzlich eine Sekunde.
@@ -318,13 +349,13 @@ Die Seite kann Container anlegen, neu starten und Updates anstoßen. Deshalb ist
   (`ecspve passwort`).
 - Jede Sperre geht als Benachrichtigung an `MELDUNG_URL`, auf Wunsch auch jede erfolgreiche Anmeldung.
 
-**Sitzungen**
+### Sitzungen
 - Nach 30 Minuten ohne Seite offen oder spätestens nach 12 Stunden neu anmelden. Nach dem zweiten Faktor gibt es ein
   neues Sitzungs-Token. Nur im Speicher – ein Neustart des Dienstes meldet alle ab.
 - **Alle anderen abmelden** unter **Sicherheit**, z. B. wenn ein Rechner verloren ging.
 - Cookies sind `HttpOnly`, `SameSite=Strict` und hinter HTTPS `Secure`.
 
-**Zugang und Browser**
+### Zugang und Browser
 - Mit `PROXY_IP`: nur über euren Caddy erreichbar, Anmeldung nur über HTTPS. Ohne `PROXY_IP` warnt die Seite.
   Zusätzlich sinnvoll: im Caddy nur das Vereinsnetz oder VPN zulassen (Beispiel oben).
 - Aktionen brauchen einen eigenen Header und eine passende Herkunft (`Origin`) – ein fremdes Formular oder eine fremde
@@ -332,12 +363,13 @@ Die Seite kann Container anlegen, neu starten und Updates anstoßen. Deshalb ist
 - Strenge Content-Security-Policy (nur eigene Skripte, keine eingebetteten), kein Einbetten in fremde Seiten,
   `nosniff`, HSTS hinter HTTPS. Langsame oder hängende Verbindungen werden nach 30 Sekunden getrennt.
 
-**Nachvollziehbar**
+### Nachvollziehbar
 - Unter **Sicherheit → Letzte Ereignisse** und in `/var/lib/ecspve/sicherheit.jsonl`: Anmeldungen, Fehlversuche,
   Sperren, Änderungen am zweiten Faktor und jede Aktion (Neustart, Update, Container anlegen …) – mit IP.
   Auch im Journal: `journalctl -u ecspve | grep Sicherheit`.
 
-**Host**
+### Host
+
 - Was der Container auf dem Host darf, steht vollständig in `deploy/proxmox/ecspve-helfer` – nichts darüber hinaus,
   keine Shell. Freigabe zurücknehmen: die Zeile mit `ecspve-ct<ID>` aus `/root/.ssh/authorized_keys` löschen.
 - Das Monitoring-Token erlaubt nur Lesen.

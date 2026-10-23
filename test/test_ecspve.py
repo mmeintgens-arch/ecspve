@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -198,6 +199,16 @@ class HelferBefehle(unittest.TestCase):
 GEHEIM = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 
+def zf_von(name):
+    return (ecspve.benutzer(name) or {}).get("zf")
+
+
+def kommandozeile(*args, eingabe=None):
+    p = subprocess.run([sys.executable, str(PROJEKT / "ecspve.py"), *args], capture_output=True, text=True,
+                       input=eingabe, timeout=60)
+    return p.returncode, p.stdout + p.stderr
+
+
 def konfig(**werte):
     """ecspve.env für einen Test umschreiben (Grundstand aus fake.py plus Werte)."""
     zeilen = ["PVE_HOST=192.168.10.5", "PORT=8080", "TOKEN=test-token-123"] + [f"{k}={v}" for k, v in werte.items()]
@@ -208,7 +219,7 @@ def konfig(**werte):
 class Weboberflaeche(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        (ORDNER / "conf" / "passwort").write_text(ecspve.passwort_hash("richtig-richtig") + "\n")
+        cls.HASH = ecspve.passwort_hash("richtig-richtig")
         cls.sammler = ecspve.Sammler()
         cls.sammler.start()
         ecspve.Anfrage.sammler, ecspve.Anfrage.anmeldung = cls.sammler, ecspve.Anmeldung()
@@ -226,17 +237,19 @@ class Weboberflaeche(unittest.TestCase):
     def setUp(self):
         # Jeder Test mit frischen Sperren, eingerichtetem zweiten Faktor und Grundeinstellungen
         ecspve.Anfrage.anmeldung = ecspve.Anmeldung()
-        ecspve.zf_speichern({"geheim": GEHEIM, "seit": 1.0, "letzter_schritt": 0,
-                             "notfall": [ecspve.notfall_hash("abcde23456")]})
+        with ecspve.benutzer_aendern() as d:
+            d["benutzer"] = {"admin": {
+                "rolle": "admin", "hash": self.HASH, "aktiv": True, "erstellt": 1.0, "muss_aendern": False,
+                "zf": {"geheim": GEHEIM, "seit": 1.0, "letzter_schritt": 0, "notfall": [ecspve.notfall_hash("abcde23456")]}}}
         konfig()
 
-    def naechster_code(self):
+    def naechster_code(self, name="admin", geheim=GEHEIM):
         """Ein gültiger, noch nicht benutzter Code (jeder Code gilt bei der Anmeldung nur einmal)."""
         while True:
             jetzt = int(time.time() // 30)
-            schritt = max((ecspve.zf_laden() or {}).get("letzter_schritt", 0) + 1, jetzt - 1)
+            schritt = max((zf_von(name) or {}).get("letzter_schritt", 0) + 1, jetzt - 1)
             if schritt <= jetzt + 1:
-                return ecspve.totp(GEHEIM, schritt)
+                return ecspve.totp(geheim, schritt)
             time.sleep(1)
 
     def ruhig(self):
@@ -260,12 +273,12 @@ class Weboberflaeche(unittest.TestCase):
         r = c.getresponse()
         return r.status, r.read().decode(), dict(r.getheaders())
 
-    def anmelden(self):
-        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+    def anmelden(self, name="admin", passwort="richtig-richtig", geheim=GEHEIM):
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": name, "passwort": passwort}, {"X-ECSPVE": "1"})
         self.assertEqual((status, json.loads(text)["schritt"]), (200, "code"))
         vorstufe = kopf["Set-Cookie"].split(";")[0]
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": vorstufe})[0], 401)  # Passwort allein reicht nicht
-        status, text, kopf = self.anfrage("POST", "/api/anmelden/code", {"code": self.naechster_code()},
+        status, text, kopf = self.anfrage("POST", "/api/anmelden/code", {"code": self.naechster_code(name, geheim)},
                                           {"X-ECSPVE": "1", "Cookie": vorstufe})
         self.assertEqual(status, 200, text)
         cookie = kopf["Set-Cookie"].split(";")[0]
@@ -273,8 +286,9 @@ class Weboberflaeche(unittest.TestCase):
         return cookie
 
     def test_passwort(self):
-        self.assertTrue(ecspve.passwort_pruefen("richtig-richtig"))
-        self.assertFalse(ecspve.passwort_pruefen("falsch"))
+        self.assertTrue(ecspve.anmeldung_pruefen("admin", "richtig-richtig"))
+        self.assertIsNone(ecspve.anmeldung_pruefen("admin", "falsch"))
+        self.assertIsNone(ecspve.anmeldung_pruefen("gibtsnicht", "richtig-richtig"))
 
     def test_ohne_anmeldung(self):
         self.assertEqual(self.anfrage("GET", "/api/status")[0], 401)
@@ -282,7 +296,7 @@ class Weboberflaeche(unittest.TestCase):
         self.assertEqual(self.anfrage("GET", "/")[0], 200)
         self.assertEqual(self.anfrage("GET", "/ping")[1], "ok\n")
         # POST ohne eigenen Header (fremdes Formular) wird abgelehnt
-        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"})[0], 403)
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"})[0], 403)
         self.assertEqual(self.anfrage("POST", "/api/aktion", {"id": 101, "aktion": "start"}, {"X-ECSPVE": "1"})[0], 401)
 
     def test_health(self):
@@ -376,8 +390,9 @@ class Weboberflaeche(unittest.TestCase):
         self.assertIsNone(ecspve.totp_schritt(geheim, "287082", jetzt=59 + 90))
 
     def test_erste_anmeldung_richtet_zweiten_faktor_ein(self):
-        ecspve.ZF_FILE.unlink()
-        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        with ecspve.benutzer_aendern() as d:
+            d["benutzer"]["admin"]["zf"] = None
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
         self.assertEqual(json.loads(text)["schritt"], "einrichten")
         vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
         self.assertEqual(self.anfrage("GET", "/api/status", kopf=vorstufe)[0], 401)
@@ -396,34 +411,34 @@ class Weboberflaeche(unittest.TestCase):
         cookie = kopf["Set-Cookie"].split(";")[0]
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 200)
         self.assertNotIn(geheim, ecspve.SICHERHEIT_FILE.read_text())
-        self.assertEqual(oct(ecspve.ZF_FILE.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct(ecspve.BENUTZER_FILE.stat().st_mode & 0o777), "0o600")
         # Steht der zweite Faktor einmal, gibt es ohne Code kein neues Geheimnis mehr
-        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
         self.assertEqual(json.loads(text)["schritt"], "code")
         vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
         self.assertEqual(self.anfrage("POST", "/api/zwei-faktor/start", {}, vorstufe)[0], 403)
 
     def test_code_nur_einmal_und_notfallcode(self):
-        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
         vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
         self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": "123"}, vorstufe)[0], 403)
         code = self.naechster_code()
         self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": code}, vorstufe)[0], 200)
         # Derselbe Code ein zweites Mal (mitgelesen): abgelehnt
-        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
         vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
         self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": code}, vorstufe)[0], 403)
         # Notfallcode (Schreibweise egal) – genau einmal
         status, text, _ = self.anfrage("POST", "/api/anmelden/code", {"code": "ABCDE-23456"}, vorstufe)
         self.assertEqual((status, json.loads(text)["notfall"], json.loads(text)["notfall_uebrig"]), (200, True, 0))
-        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
         vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
         self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": "abcde23456"}, vorstufe)[0], 403)
 
     def test_sperre_nach_fehlversuchen(self):
         for _ in range(5):
-            self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "falsch"}, {"X-ECSPVE": "1"})[0], 403)
-        status, text, _ = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
+            self.assertEqual(self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "falsch"}, {"X-ECSPVE": "1"})[0], 403)
+        status, text, _ = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, {"X-ECSPVE": "1"})
         self.assertEqual(status, 429)  # auch mit richtigem Passwort
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Authorization": "Bearer test-token-123"})[0], 429)
         self.assertEqual(self.anfrage("GET", "/ping")[0], 200)
@@ -435,7 +450,7 @@ class Weboberflaeche(unittest.TestCase):
         for i in range(10):
             vom_proxy = {"X-ECSPVE": "1", "X-Forwarded-Proto": "https", "X-Forwarded-For": f"198.51.100.{i}"}
             konfig(PROXY_IP="127.0.0.3")
-            status, text, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, vom_proxy,
+            status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, vom_proxy,
                                               von="127.0.0.3")
             vom_proxy["Cookie"] = kopf["Set-Cookie"].split(";")[0]
             self.assertEqual(self.anfrage("POST", "/api/anmelden/code", {"code": "000000"}, vom_proxy,
@@ -447,13 +462,14 @@ class Weboberflaeche(unittest.TestCase):
         self.assertTrue(any("vermutlich bekannt" in e["text"] for e in ecspve.letzte_ereignisse(20)))
 
     def test_sitzung_verraet_nichts(self):
-        self.assertEqual(json.loads(self.anfrage("GET", "/api/sitzung")[1]), {"stufe": None, "zwei_faktor": None})
+        self.assertEqual(json.loads(self.anfrage("GET", "/api/sitzung")[1]), {"stufe": None, "schritt": None})
 
     def test_sitzung_endet_bei_neuem_passwort(self):
         cookie = self.anmelden()
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 200)
         time.sleep(0.01)
-        (ORDNER / "conf" / "passwort").write_text(ecspve.passwort_hash("richtig-richtig") + "\n")
+        with ecspve.benutzer_aendern() as d:
+            d["benutzer"]["admin"]["hash"] = ecspve.passwort_hash("richtig-richtig")
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": cookie})[0], 401)
 
     def test_zweiten_faktor_verwalten(self):
@@ -474,7 +490,7 @@ class Weboberflaeche(unittest.TestCase):
         status, text, antwort = self.anfrage("POST", "/api/zwei-faktor/bestaetigen",
                                              {"code": ecspve.totp(neu, int(time.time() // 30))}, kopf)
         self.assertEqual(status, 200, text)
-        self.assertEqual(ecspve.zf_laden()["geheim"], neu)
+        self.assertEqual(zf_von("admin")["geheim"], neu)
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": zweite})[0], 401)
         neues_cookie = antwort["Set-Cookie"].split(";")[0]
         self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": neues_cookie})[0], 200)
@@ -490,9 +506,9 @@ class Weboberflaeche(unittest.TestCase):
         for name in ("Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"):
             self.assertIn(name, kopf)
         fremd = {"X-ECSPVE": "1", "Origin": "https://angreifer.example"}
-        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, fremd)[0], 403)
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, fremd)[0], 403)
         eigen = {"X-ECSPVE": "1", "Origin": f"http://127.0.0.1:{self.port}"}
-        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, eigen)[0], 200)
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, eigen)[0], 200)
 
     def test_nur_ueber_den_proxy(self):
         konfig(PROXY_IP="127.0.0.3")
@@ -501,22 +517,136 @@ class Weboberflaeche(unittest.TestCase):
         self.assertEqual(self.anfrage("GET", "/api/sitzung", von="127.0.0.2")[0], 403)
         self.assertIn(self.anfrage("GET", "/health", von="127.0.0.2")[0], (200, 503))
         # Vom Proxy, aber ohne HTTPS: keine Anmeldung
-        status, text, _ = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"},
+        status, text, _ = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"},
                                        {"X-ECSPVE": "1", "X-Forwarded-For": "192.0.2.10"}, von="127.0.0.3")
         self.assertEqual(status, 403)
         self.assertIn("HTTPS", json.loads(text)["fehler"])
         # Vom Proxy mit HTTPS: Cookie mit Secure, HSTS, Sperre trifft die echte Besucher-IP
         https = {"X-ECSPVE": "1", "X-Forwarded-Proto": "https", "X-Forwarded-For": "192.0.2.10"}
-        status, _, kopf = self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, https, von="127.0.0.3")
+        status, _, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, https, von="127.0.0.3")
         self.assertEqual(status, 200)
         self.assertIn("Secure", kopf["Set-Cookie"])
         self.assertIn("Strict-Transport-Security", kopf)
         for _ in range(5):
-            self.anfrage("POST", "/api/anmelden", {"passwort": "falsch"}, https, von="127.0.0.3")
-        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "x"}, https, von="127.0.0.3")[0], 429)
+            self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "falsch"}, https, von="127.0.0.3")
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "x"}, https, von="127.0.0.3")[0], 429)
         anderer = dict(https, **{"X-Forwarded-For": "192.0.2.11"})
-        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"passwort": "richtig-richtig"}, anderer,
+        self.assertEqual(self.anfrage("POST", "/api/anmelden", {"benutzer": "admin", "passwort": "richtig-richtig"}, anderer,
                                       von="127.0.0.3")[0], 200)
+
+
+    def test_benutzer_und_rollen(self):
+        admin = {"Cookie": self.anmelden(), "X-ECSPVE": "1"}
+        # Benutzer verwalten nur mit frisch bestätigtem Code
+        status, text, _ = self.anfrage("POST", "/api/benutzer/anlegen", {"name": "max", "rolle": "lesen"}, admin)
+        self.assertEqual((status, json.loads(text).get("code_noetig")), (403, True))
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/freigabe", {"code": "000000"}, admin)[0], 403)
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/freigabe", {"code": self.naechster_code()}, admin)[0], 200)
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/anlegen", {"name": "Max Muster"}, admin)[0], 403)
+        status, text, _ = self.anfrage("POST", "/api/benutzer/anlegen", {"name": "max", "rolle": "lesen"}, admin)
+        start = json.loads(text)["passwort"]
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/anlegen", {"name": "max"}, admin)[0], 403)  # gibt es schon
+        # Erste Anmeldung: Startpasswort ersetzen, dann eigenen zweiten Faktor einrichten
+        status, text, kopf = self.anfrage("POST", "/api/anmelden", {"benutzer": "max", "passwort": start}, {"X-ECSPVE": "1"})
+        self.assertEqual(json.loads(text)["schritt"], "neues-passwort")
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        self.assertEqual(self.anfrage("POST", "/api/zwei-faktor/start", {}, vorstufe)[0], 403)
+        self.assertEqual(self.anfrage("POST", "/api/anmelden/neues-passwort", {"passwort": start}, vorstufe)[0], 400)
+        self.assertEqual(self.anfrage("POST", "/api/anmelden/neues-passwort", {"passwort": "kurz"}, vorstufe)[0], 400)
+        status, text, kopf = self.anfrage("POST", "/api/anmelden/neues-passwort", {"passwort": "max-eigenes-passwort"},
+                                          vorstufe)
+        self.assertEqual(json.loads(text)["schritt"], "einrichten")
+        vorstufe = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        geheim = json.loads(self.anfrage("POST", "/api/zwei-faktor/start", {}, vorstufe)[1])["geheim"].replace(" ", "")
+        self.assertNotEqual(geheim, GEHEIM)  # jeder hat seinen eigenen
+        status, text, kopf = self.anfrage("POST", "/api/zwei-faktor/bestaetigen",
+                                          {"code": ecspve.totp(geheim, int(time.time() // 30))}, vorstufe)
+        self.assertEqual(status, 200, text)
+        max_ = {"X-ECSPVE": "1", "Cookie": kopf["Set-Cookie"].split(";")[0]}
+        st = json.loads(self.anfrage("GET", "/api/status", kopf=max_)[1])
+        self.assertEqual(st["ich"]["rolle"], "lesen")
+        self.assertNotIn("benutzer", st)
+        self.assertTrue(all(e["wer"] == "max" for e in st["sicherheit"]["ereignisse"]))
+        # Nur ansehen: keine Aktionen, keine Verwaltung
+        self.assertEqual(self.anfrage("POST", "/api/aktion", {"id": 101, "aktion": "neustart"}, max_)[0], 403)
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/anlegen", {"name": "x"}, max_)[0], 403)
+        self.assertNotEqual(self.anfrage("GET", "/api/anlegen", kopf=max_)[0], 200)
+        self.assertEqual(self.anfrage("POST", "/api/pruefen", {}, max_)[0], 200)
+        # Rolle ändern wirkt sofort, ohne neue Anmeldung
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/aendern", {"name": "max", "rolle": "bedienen"}, admin)[0], 200)
+        self.assertEqual(self.anfrage("POST", "/api/aktion", {"id": 101, "aktion": "gibtsnicht"}, max_)[0], 400)
+        # Admin sieht alle, kann sich selbst nicht herabstufen
+        namen = [b["name"] for b in json.loads(self.anfrage("GET", "/api/status", kopf=admin)[1])["benutzer"]]
+        self.assertEqual(namen, ["admin", "max"])
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/aendern", {"name": "admin", "rolle": "lesen"}, admin)[0], 403)
+        # Sperren beendet die Sitzung sofort, Löschen entfernt den Zugang
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/aendern", {"name": "max", "aktiv": False}, admin)[0], 200)
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf=max_)[0], 401)
+        status, text, _ = self.anfrage("POST", "/api/anmelden", {"benutzer": "max", "passwort": "max-eigenes-passwort"},
+                                       {"X-ECSPVE": "1"})
+        self.assertIn("gesperrt", json.loads(text)["fehler"])
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/loeschen", {"name": "max"}, admin)[0], 200)
+        self.assertIsNone(ecspve.benutzer("max"))
+        texte = [(e.get("wer"), e["text"]) for e in ecspve.letzte_ereignisse(40)]
+        self.assertIn(("admin", "Benutzer „max“ angelegt (Nur ansehen)"), texte)
+
+    def test_admin_passwort_und_zwei_faktor_zuruecksetzen(self):
+        with ecspve.benutzer_aendern() as d:
+            d["benutzer"]["eva"] = {"rolle": "bedienen", "hash": self.HASH, "aktiv": True, "muss_aendern": False,
+                                    "zf": {"geheim": GEHEIM, "seit": 2.0, "letzter_schritt": 0, "notfall": []}}
+        admin = {"Cookie": self.anmelden(), "X-ECSPVE": "1"}
+        eva = {"Cookie": self.anmelden("eva"), "X-ECSPVE": "1"}
+        self.anfrage("POST", "/api/benutzer/freigabe", {"code": self.naechster_code()}, admin)
+        self.assertEqual(self.anfrage("POST", "/api/benutzer/zwei-faktor", {"name": "eva"}, admin)[0], 200)
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf=eva)[0], 401)
+        status, text, _ = self.anfrage("POST", "/api/anmelden", {"benutzer": "eva", "passwort": "richtig-richtig"},
+                                       {"X-ECSPVE": "1"})
+        self.assertEqual(json.loads(text)["schritt"], "einrichten")
+        status, text, _ = self.anfrage("POST", "/api/benutzer/passwort", {"name": "eva"}, admin)
+        neu = json.loads(text)["passwort"]
+        self.assertEqual(len(neu), 16)
+        self.assertIsNone(ecspve.anmeldung_pruefen("eva", "richtig-richtig"))
+        self.assertTrue(ecspve.benutzer("eva")["muss_aendern"])
+
+    def test_eigenes_passwort_aendern(self):
+        erste, zweite = self.anmelden(), self.anmelden()
+        kopf = {"Cookie": erste, "X-ECSPVE": "1"}
+        self.assertEqual(self.anfrage("POST", "/api/konto/passwort", {"alt": "falsch", "neu": "x" * 12}, kopf)[0], 403)
+        self.assertEqual(self.anfrage("POST", "/api/konto/passwort", {"alt": "richtig-richtig", "neu": "kurz"}, kopf)[0], 403)
+        status, _, antwort = self.anfrage("POST", "/api/konto/passwort",
+                                          {"alt": "richtig-richtig", "neu": "ganz-neues-passwort"}, kopf)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": zweite})[0], 401)
+        neues = antwort["Set-Cookie"].split(";")[0]
+        self.assertEqual(self.anfrage("GET", "/api/status", kopf={"Cookie": neues})[0], 200)
+        self.assertTrue(ecspve.anmeldung_pruefen("admin", "ganz-neues-passwort"))
+
+    def test_bisheriger_zugang_wird_admin(self):
+        ecspve.BENUTZER_FILE.unlink()
+        ecspve.PASS_FILE.write_text(self.HASH + "\n")
+        ecspve.ZF_FILE.write_text(json.dumps({"geheim": GEHEIM, "seit": 5.0, "letzter_schritt": 0, "notfall": []}))
+        try:
+            u = ecspve.benutzer("admin")
+            self.assertEqual((u["rolle"], u["zf"]["geheim"]), ("admin", GEHEIM))
+            self.assertTrue(ecspve.anmeldung_pruefen("admin", "richtig-richtig"))
+        finally:
+            ecspve.PASS_FILE.unlink()
+            ecspve.ZF_FILE.unlink()
+
+    def test_kommandozeile(self):
+        rc, aus = kommandozeile("benutzer", "anlegen", "bob", "--rolle=lesen")
+        self.assertEqual(rc, 0, aus)
+        start = re.search(r"Startpasswort: (\S+)", aus).group(1)
+        self.assertTrue(ecspve.anmeldung_pruefen("bob", start))
+        self.assertIn("bob", kommandozeile("benutzer")[1])
+        rc, aus = kommandozeile("benutzer", "rolle", "admin", "lesen")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("mindestens einen aktiven Admin", aus)
+        self.assertEqual(kommandozeile("passwort", "--benutzer=bob", "--stdin", eingabe="bobs-neues-passwort\n")[0], 0)
+        self.assertTrue(ecspve.anmeldung_pruefen("bob", "bobs-neues-passwort"))
+        self.assertFalse(ecspve.benutzer("bob")["muss_aendern"])
+        self.assertEqual(kommandozeile("benutzer", "loeschen", "bob")[0], 0)
+        self.assertIsNone(ecspve.benutzer("bob"))
 
 
 if __name__ == "__main__":

@@ -251,6 +251,17 @@ h3.abstand { margin: 1.1rem 0 0; font-size: .9rem; }
 .ereignisse span { overflow-wrap: anywhere; }
 @media (max-width: 640px) { .ereignisse li { grid-template-columns: 1fr; gap: 0; } }
 
+/* Benutzer */
+.tabelle-rahmen { overflow-x: auto; }
+table.benutzer { width: 100%; border-collapse: collapse; font-size: .875rem; }
+table.benutzer th { text-align: left; font-weight: 600; color: var(--leise); font-size: .8rem; padding: .3rem .6rem .5rem 0; }
+table.benutzer td { padding: .5rem .6rem .5rem 0; border-top: 1px solid var(--fein); vertical-align: middle; }
+table.benutzer select { width: auto; padding: .25rem .4rem; }
+.marke-klein.gesperrt { background: var(--fehler-hg); color: var(--fehler); }
+.marke-klein.ich { background: color-mix(in srgb, var(--akzent) 14%, transparent); color: var(--akzent); }
+.startpasswort { padding: .8rem; border-radius: 8px; background: var(--warn-hg); display: grid; gap: .4rem; }
+.startpasswort code { font-size: 1.05rem; user-select: all; }
+
 /* Formulare in Dialogen */
 input:not([type="checkbox"]):not([type="radio"]), select {
   font: inherit; font-weight: 400; padding: .45rem .6rem; border-radius: 8px; border: 1px solid var(--linie);
@@ -279,3 +290,4 @@ fieldset.wahl legend { font-size: .85rem; font-weight: 600; padding: 0 .3rem; }
   .schnitt-zeile strong { grid-column: 1 / -1; }
   .gast .messwerte { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+p.abstand { margin-top: .9rem; }

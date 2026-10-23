@@ -9,7 +9,7 @@
 #   PVE_HOSTKEY="…"      SSH-Hostschlüssel des Proxmox-Hosts (Inhalt von ssh_host_ed25519_key.pub)
 #   PORT=8080            Port der Weboberfläche (nur HTTP)
 #   PROXY_IP=IP[,IP]     IP eures Reverse Proxys (leer setzt zurück, nur wenn übergeben)
-#   PASSWORT_DATEI=PFAD  Datei mit dem ersten Passwort der Weboberfläche
+#   PASSWORT_DATEI=PFAD  Datei mit dem ersten Passwort der Weboberfläche (Benutzer „admin“)
 #   REVISION=…           Git-Stand für /opt/ecspve/REVISION
 
 set -euo pipefail
@@ -89,7 +89,8 @@ fi
 
 if [ -n "${PASSWORT_DATEI:-}" ] && [ -s "$PASSWORT_DATEI" ]; then
   say "Passwort der Weboberfläche setzen"
-  python3 /opt/ecspve/ecspve.py passwort --stdin <"$PASSWORT_DATEI" >/dev/null
+  # Als Benutzer ecspve: die Benutzerdatei gehört dem Dienst
+  runuser -u ecspve -- /usr/bin/python3 /opt/ecspve/ecspve.py passwort --stdin <"$PASSWORT_DATEI" >/dev/null
 fi
 
 # --- Dienste -------------------------------------------------------------------------------------------------
@@ -103,5 +104,10 @@ systemctl start ecspve-nacht.timer
 
 for _ in $(seq 1 20); do /usr/local/bin/ecspve ping >/dev/null 2>&1 && break; sleep 1; done
 /usr/local/bin/ecspve ping >/dev/null 2>&1 || die "Die Weboberfläche startet nicht – Protokoll: journalctl -u ecspve -n 50"
-[ -f /etc/ecspve/passwort ] || warn "Noch kein Passwort gesetzt – im Container: ecspve passwort"
+# Der bisherige einzelne Zugang steckt jetzt im Benutzer „admin“ (übernimmt der Dienst beim Start)
+if grep -qs '"hash"' /var/lib/ecspve/benutzer.json; then
+  rm -f /etc/ecspve/passwort
+else
+  warn "Noch kein Benutzer – im Container: ecspve passwort (legt den Admin an)"
+fi
 echo "Weboberfläche läuft (Port $(sed -n 's/^PORT=//p' "$ENV_FILE" | tail -n1))."

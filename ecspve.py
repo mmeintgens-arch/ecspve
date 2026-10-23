@@ -8,19 +8,24 @@ Helfer aufrufen darf.
   ecspve serve           Weboberfläche (systemd: ecspve.service)
   ecspve nacht           nächtliche Updates (systemd: ecspve-nacht.timer)
   ecspve status          Übersicht im Terminal
-  ecspve passwort        Passwort der Weboberfläche setzen (--stdin: aus der Eingabe lesen)
+  ecspve passwort        Passwort von „admin“ setzen, legt ihn bei Bedarf an (--benutzer=NAME, --stdin)
+  ecspve benutzer        Benutzer anzeigen; außerdem:
+    ecspve benutzer anlegen NAME [--rolle=admin|bedienen|lesen]   (zeigt das Startpasswort)
+    ecspve benutzer passwort|zwei-faktor|sperren|entsperren|loeschen NAME
+    ecspve benutzer rolle NAME admin|bedienen|lesen
   ecspve token [--neu]   Token für Monitoring-Abfragen anzeigen bzw. neu erzeugen
   ecspve ping            prüft, ob die Weboberfläche antwortet
   ecspve verbindung      prüft die Verbindung zum Helfer auf dem Proxmox-Host
-  ecspve zwei-faktor [zuruecksetzen]
-                         Stand des zweiten Faktors; zuruecksetzen = Handy verloren und keine Notfallcodes mehr:
-                         bei der nächsten Anmeldung wird eine neue Authenticator-App eingerichtet
+  ecspve zwei-faktor zuruecksetzen [NAME]
+                         Handy verloren und keine Notfallcodes mehr (Standard: admin): bei der nächsten
+                         Anmeldung wird eine neue Authenticator-App eingerichtet
 """
 
 import base64
+import contextlib
 import email.header
+import fcntl
 import getpass
-import grp
 import hashlib
 import hmac
 import http.server
@@ -45,11 +50,12 @@ WEB = Path(__file__).resolve().parent / "web"
 CONF_DIR = Path(os.environ.get("ECSPVE_CONF_DIR", "/etc/ecspve"))
 STATE_DIR = Path(os.environ.get("ECSPVE_STATE_DIR", "/var/lib/ecspve"))
 CONF_FILE = CONF_DIR / "ecspve.env"
-PASS_FILE = CONF_DIR / "passwort"
+PASS_FILE = CONF_DIR / "passwort"  # bisheriger einzelner Zugang – wird zu „admin“ übernommen
 SSH_DIR = CONF_DIR / "ssh"
 EINST_FILE = STATE_DIR / "gaeste.json"
 NACHT_FILE = STATE_DIR / "nacht.json"
-ZF_FILE = STATE_DIR / "zwei-faktor.json"
+ZF_FILE = STATE_DIR / "zwei-faktor.json"  # nur noch zum Übernehmen in benutzer.json
+BENUTZER_FILE = STATE_DIR / "benutzer.json"
 SICHERHEIT_FILE = STATE_DIR / "sicherheit.jsonl"
 
 VORGABEN = {
@@ -68,6 +74,10 @@ SPERRE_CODES = 10               # falsche Codes nach richtigem Passwort je Stund
 PASSWORT_MIN = 12
 PBKDF2_RUNDEN = 600_000
 NOTFALL_ZEICHEN = "abcdefghjkmnpqrstuvwxyz23456789"
+ROLLEN = {"admin": "Admin", "bedienen": "Bedienen", "lesen": "Nur ansehen"}
+RANG = {"lesen": 0, "bedienen": 1, "admin": 2}
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._@-]{1,63}$")
+FREIGABE_DAUER = 10 * 60  # nach einem Code so lange Benutzer verwalten, ohne erneut zu fragen
 AUFTRAG_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,120}\.service$")
 
@@ -387,7 +397,7 @@ class Sammler:
         return bool(laufende)
 
 
-# --- Anmeldung: Passwort und zweiter Faktor --------------------------------------------------------------
+# --- Benutzer, Passwörter und zweiter Faktor -------------------------------------------------------------
 
 def passwort_hash(passwort):
     salz = secrets.token_bytes(16)
@@ -395,15 +405,29 @@ def passwort_hash(passwort):
     return f"pbkdf2_sha256${PBKDF2_RUNDEN}${base64.b64encode(salz).decode()}${base64.b64encode(wert).decode()}"
 
 
-def passwort_pruefen(passwort):
+def hash_pruefen(gespeichert, passwort):
     try:
-        art, runden, salz, wert = PASS_FILE.read_text(encoding="utf-8").strip().split("$")
-    except (OSError, ValueError):
+        art, runden, salz, wert = str(gespeichert).strip().split("$")
+    except ValueError:
         return False
     if art != "pbkdf2_sha256":
         return False
     probe = hashlib.pbkdf2_hmac("sha256", passwort.encode(), base64.b64decode(salz), int(runden))
     return hmac.compare_digest(probe, base64.b64decode(wert))
+
+
+_ATTRAPPE = []
+
+
+def attrappen_hash():
+    """Zum Vergleichen, wenn es den Benutzernamen nicht gibt – damit die Antwort gleich lange dauert."""
+    if not _ATTRAPPE:
+        _ATTRAPPE.append(passwort_hash(secrets.token_urlsafe(16)))
+    return _ATTRAPPE[0]
+
+
+def neues_startpasswort():
+    return "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789") for _ in range(16))
 
 
 def totp(geheim, schritt):
@@ -437,58 +461,113 @@ def neue_notfallcodes(anzahl=8):
     return [f"{c[:5]}-{c[5:]}" for c in codes], [notfall_hash(c) for c in codes]
 
 
-ZF_LOCK = threading.Lock()
+BENUTZER_LOCK = threading.Lock()
 
 
-def zf_laden():
-    daten = lies_json(ZF_FILE, None)
-    return daten if isinstance(daten, dict) and daten.get("geheim") else None
+def benutzer_lesen():
+    """Alle Zugänge. Fehlt die Datei noch, wird der bisherige einzelne Zugang (Passwort und App) zu „admin“."""
+    daten = lies_json(BENUTZER_FILE, None)
+    if isinstance(daten, dict) and isinstance(daten.get("benutzer"), dict):
+        return daten
+    daten = {"benutzer": {}}
+    try:
+        bisher = PASS_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        bisher = ""
+    if bisher:
+        zf = lies_json(ZF_FILE, None)
+        daten["benutzer"]["admin"] = {"rolle": "admin", "hash": bisher, "aktiv": True, "erstellt": time.time(),
+                                      "muss_aendern": False,
+                                      "zf": zf if isinstance(zf, dict) and zf.get("geheim") else None}
+    return daten
 
 
-def zf_speichern(daten):
-    ZF_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ZF_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(daten), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(ZF_FILE)
+@contextlib.contextmanager
+def benutzer_aendern():
+    """Lesen, ändern, schreiben – auch gegen die Kommandozeile (ecspve benutzer …) gesperrt."""
+    with BENUTZER_LOCK:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(BENUTZER_FILE.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            daten = benutzer_lesen()
+            yield daten
+            tmp = BENUTZER_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(daten, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(BENUTZER_FILE)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
-def code_pruefen(code, anmeldung=False):
-    """Prüft einen Code aus der App oder einen Notfallcode und gibt "app", "notfall" oder None zurück.
+def benutzer(name):
+    return benutzer_lesen()["benutzer"].get(name or "")
+
+
+def benutzer_liste():
+    """Für die Verwaltung – ohne Passwörter und Geheimnisse."""
+    liste = []
+    for name, u in sorted(benutzer_lesen()["benutzer"].items()):
+        zf = u.get("zf") or {}
+        liste.append({"name": name, "rolle": u.get("rolle"), "aktiv": u.get("aktiv", True),
+                      "zwei_faktor": bool(zf), "notfall_uebrig": len(zf.get("notfall", [])),
+                      "muss_aendern": u.get("muss_aendern", False), "erstellt": u.get("erstellt"),
+                      "letzte_anmeldung": u.get("letzte_anmeldung")})
+    return liste
+
+
+def admin_bleibt(daten):
+    if not any(u.get("rolle") == "admin" and u.get("aktiv", True) for u in daten["benutzer"].values()):
+        raise Verweigert("Es muss immer mindestens einen aktiven Admin geben.")
+
+
+def anmeldung_pruefen(name, passwort):
+    """Der Benutzer bei richtigem Passwort, sonst None – gleich lange, ob es den Namen gibt oder nicht."""
+    u = benutzer(name)
+    richtig = hash_pruefen(u["hash"] if u else attrappen_hash(), passwort)
+    return u if u and richtig else None
+
+
+def naechster_schritt(u):
+    if u.get("muss_aendern"):
+        return "neues-passwort"
+    return "code" if u.get("zf") else "einrichten"
+
+
+def code_pruefen(name, code, anmeldung=False):
+    """Prüft einen Code aus der App oder einen Notfallcode des Benutzers: "app", "notfall" oder None.
 
     Notfallcodes gelten nur einmal. Bei der Anmeldung gilt auch ein App-Code nur einmal – wer ihn mitliest,
     kann ihn nicht noch einmal benutzen."""
     code = re.sub(r"[\s-]", "", str(code or "")).lower()
-    with ZF_LOCK:
-        daten = zf_laden()
-        if not daten:
+    if not re.fullmatch(r"[0-9]{6}", code) and not re.fullmatch(f"[{NOTFALL_ZEICHEN}]{{10}}", code):
+        return None
+    with benutzer_aendern() as daten:
+        zf = (daten["benutzer"].get(name) or {}).get("zf")
+        if not zf:
             return None
-        if re.fullmatch(r"[0-9]{6}", code):
-            schritt = totp_schritt(daten["geheim"], code)
-            if schritt is None or (anmeldung and schritt <= daten.get("letzter_schritt", 0)):
+        if len(code) == 6:
+            schritt = totp_schritt(zf["geheim"], code)
+            if schritt is None or (anmeldung and schritt <= zf.get("letzter_schritt", 0)):
                 return None
             if anmeldung:
-                daten["letzter_schritt"] = schritt
-                zf_speichern(daten)
+                zf["letzter_schritt"] = schritt
             return "app"
-        if re.fullmatch(f"[{NOTFALL_ZEICHEN}]{{10}}", code):
-            gesucht = notfall_hash(code)
-            for i, gespeichert in enumerate(daten.get("notfall", [])):
-                if hmac.compare_digest(gespeichert, gesucht):
-                    del daten["notfall"][i]
-                    zf_speichern(daten)
-                    return "notfall"
+        gesucht = notfall_hash(code)
+        for i, gespeichert in enumerate(zf.get("notfall", [])):
+            if hmac.compare_digest(gespeichert, gesucht):
+                del zf["notfall"][i]
+                return "notfall"
         return None
 
 
-def anmeldestand():
-    """Ändert sich, wenn Passwort oder zweiter Faktor neu gesetzt werden – ältere Sitzungen gelten dann nicht mehr."""
-    try:
-        passwort = PASS_FILE.stat().st_mtime_ns
-    except OSError:
-        passwort = None
-    zf = zf_laden()
-    return passwort, zf.get("seit") if zf else None
+def anmeldestand(name):
+    """Ändert sich mit Passwort, zweitem Faktor oder Sperre des Benutzers – ältere Sitzungen gelten dann nicht mehr."""
+    u = benutzer(name)
+    if not u or not u.get("aktiv", True):
+        return None
+    return u["hash"], (u.get("zf") or {}).get("seit")
 
 
 def qr_bild(text):
@@ -503,9 +582,9 @@ def qr_bild(text):
     return "data:image/svg+xml;base64," + base64.b64encode(p.stdout).decode()
 
 
-def einrichtung(geheim):
+def einrichtung(geheim, name):
     aussteller = urllib.parse.quote("ECS Proxmox")
-    uri = (f"otpauth://totp/{aussteller}:{urllib.parse.quote('Übersicht')}?secret={geheim}&issuer={aussteller}"
+    uri = (f"otpauth://totp/{aussteller}:{urllib.parse.quote(name)}?secret={geheim}&issuer={aussteller}"
            "&digits=6&period=30")
     return {"geheim": " ".join(geheim[i:i + 4] for i in range(0, len(geheim), 4)), "uri": uri, "qr": qr_bild(uri)}
 
@@ -513,10 +592,10 @@ def einrichtung(geheim):
 EREIGNIS_LOCK = threading.Lock()
 
 
-def ereignis(ip, text, ok=True):
-    """Sicherheitsprotokoll: Anmeldungen, Fehlversuche, Sperren, Änderungen und Aktionen – mit IP."""
-    log(f"{'' if ok else 'WARNUNG '}Sicherheit: {text} ({ip})")
-    eintrag = json.dumps({"zeit": time.time(), "ip": ip, "text": text, "ok": ok}, ensure_ascii=False)
+def ereignis(ip, text, ok=True, wer=""):
+    """Sicherheitsprotokoll: Anmeldungen, Fehlversuche, Sperren, Änderungen und Aktionen – mit IP und Benutzer."""
+    log(f"{'' if ok else 'WARNUNG '}Sicherheit: {text} ({wer + ', ' if wer else ''}{ip})")
+    eintrag = json.dumps({"zeit": time.time(), "ip": ip, "wer": wer, "text": text, "ok": ok}, ensure_ascii=False)
     with EREIGNIS_LOCK:
         try:
             SICHERHEIT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -535,17 +614,22 @@ def ereignis(ip, text, ok=True):
             log(f"Sicherheitsprotokoll nicht schreibbar: {e}")
 
 
-def letzte_ereignisse(anzahl=15):
+def letzte_ereignisse(anzahl=15, wer=None):
+    """Die neuesten Einträge – mit wer=… nur die eines Benutzers."""
     try:
-        zeilen = SICHERHEIT_FILE.read_text(encoding="utf-8").splitlines()[-anzahl:]
+        zeilen = SICHERHEIT_FILE.read_text(encoding="utf-8").splitlines()[-1000:]
     except OSError:
         return []
     liste = []
     for zeile in reversed(zeilen):
         try:
-            liste.append(json.loads(zeile))
+            e = json.loads(zeile)
         except ValueError:
-            pass
+            continue
+        if wer is None or e.get("wer") == wer:
+            liste.append(e)
+            if len(liste) >= anzahl:
+                break
     return liste
 
 
@@ -558,32 +642,34 @@ class Anmeldung:
         self.fehlversuche = {}
         self.falsche_codes = []
 
-    def neu(self, stufe, ip):
+    def neu(self, stufe, ip, name):
         token = secrets.token_urlsafe(32)
         jetzt = time.time()
-        stand = anmeldestand()
+        stand = anmeldestand(name)
         with self.lock:
-            self.sitzungen = {t: s for t, s in self.sitzungen.items() if self._gueltig(s, jetzt, stand)}
-            self.sitzungen[token] = {"stufe": stufe, "start": jetzt, "aktiv": jetzt, "ip": ip, "stand": stand}
+            self.sitzungen = {t: s for t, s in self.sitzungen.items() if self._frisch(s, jetzt)}
+            self.sitzungen[token] = {"stufe": stufe, "start": jetzt, "aktiv": jetzt, "ip": ip, "benutzer": name,
+                                     "stand": stand}
         return token
 
     @staticmethod
-    def _gueltig(s, jetzt, stand):
+    def _frisch(s, jetzt):
         dauer = SITZUNG_HOECHSTENS if s["stufe"] == "voll" else VORSTUFE_DAUER
-        return jetzt - s["start"] < dauer and jetzt - s["aktiv"] < SITZUNG_LEERLAUF and s["stand"] == stand
+        return jetzt - s["start"] < dauer and jetzt - s["aktiv"] < SITZUNG_LEERLAUF
 
     def hole(self, token):
-        """Die Sitzung zum Token – None, wenn abgelaufen oder Passwort/zweiter Faktor inzwischen geändert."""
+        """Die Sitzung zum Token – None, wenn abgelaufen oder Passwort, zweiter Faktor oder Zugang geändert."""
         if not token:
             return None
-        stand = anmeldestand()
         with self.lock:
             s = self.sitzungen.get(token)
-            if not s:
-                return None
-            jetzt = time.time()
-            if not self._gueltig(s, jetzt, stand):
-                del self.sitzungen[token]
+        if not s:
+            return None
+        stand = anmeldestand(s["benutzer"])
+        jetzt = time.time()
+        with self.lock:
+            if not self._frisch(s, jetzt) or stand is None or s["stand"] != stand:
+                self.sitzungen.pop(token, None)
                 return None
             s["aktiv"] = jetzt
             return s
@@ -592,14 +678,15 @@ class Anmeldung:
         with self.lock:
             self.sitzungen.pop(token or "", None)
 
-    def alle_beenden(self, ausser=None):
+    def alle_beenden(self, name, ausser=None):
         with self.lock:
-            self.sitzungen = {t: s for t, s in self.sitzungen.items() if t == ausser}
+            self.sitzungen = {t: s for t, s in self.sitzungen.items() if s["benutzer"] != name or t == ausser}
 
-    def angemeldet(self):
-        jetzt, stand = time.time(), anmeldestand()
+    def anzahl(self, name):
+        jetzt, stand = time.time(), anmeldestand(name)
         with self.lock:
-            return sum(1 for s in self.sitzungen.values() if s["stufe"] == "voll" and self._gueltig(s, jetzt, stand))
+            return sum(1 for s in self.sitzungen.values() if s["benutzer"] == name and s["stufe"] == "voll"
+                       and self._frisch(s, jetzt) and s["stand"] == stand)
 
     def gesperrt(self, ip):
         """"ip", wenn diese IP zu oft falsch lag, "gesamt" bei vielen Fehlversuchen von überall, sonst None."""
@@ -794,8 +881,19 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         return self.anmeldung.hole(self.token_der_sitzung())
 
     def angemeldet(self):
+        """Volle Sitzung (Passwort und zweiter Faktor) mit der aktuellen Rolle des Benutzers – sonst None."""
         s = self.sitzung()
-        return s if s and s["stufe"] == "voll" else None
+        if not s or s["stufe"] != "voll":
+            return None
+        u = benutzer(s["benutzer"])
+        if not u:
+            return None
+        s["rolle"] = u.get("rolle", "lesen")
+        return s
+
+    @staticmethod
+    def darf(s, rolle):
+        return bool(s) and RANG.get(s.get("rolle"), -1) >= RANG[rolle]
 
     def token_ok(self):
         konf = lade_konfig()
@@ -812,9 +910,9 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         self.fehlversuch("Falsches Monitoring-Token")
         return False
 
-    def fehlversuch(self, text):
+    def fehlversuch(self, text, wer=""):
         ip = self.client_ip()
-        ereignis(ip, text, ok=False)
+        ereignis(ip, text, ok=False, wer=wer)
         if self.anmeldung.fehlversuch(ip):
             art = self.anmeldung.gesperrt(ip)
             text = (f"{SPERRE_IP} Fehlversuche von {ip} – diese Adresse ist 15 Minuten gesperrt." if art == "ip" else
@@ -858,9 +956,10 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
             return self.senden(503, text, "text/plain; charset=utf-8")
         if pfad == "/api/sitzung":
             s = self.sitzung()
-            # Ob der zweite Faktor schon steht, erfährt nur, wer das Passwort kennt
-            return self.senden(200, {"stufe": s["stufe"] if s else None,
-                                     "zwei_faktor": zf_laden() is not None if s else None})
+            u = benutzer(s["benutzer"]) if s else None
+            # Wie es weitergeht, erfährt nur, wer das Passwort kennt
+            schritt = naechster_schritt(u) if s and u and s["stufe"] == "passwort" else None
+            return self.senden(200, {"stufe": s["stufe"] if s else None, "schritt": schritt})
         sitzung = self.angemeldet()
         if not sitzung and not self.token_ok():
             return self.fehler(401, "Bitte anmelden.")
@@ -868,19 +967,25 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
             st = self.sammler.status()
             if sitzung:
                 self.sammler.besuch()
+                ich = sitzung["benutzer"]
+                admin = self.darf(sitzung, "admin")
                 konf = lade_konfig()
-                zf = zf_laden() or {}
+                zf = (benutzer(ich) or {}).get("zf") or {}
+                st["ich"] = {"name": ich, "rolle": sitzung["rolle"], "rollen": ROLLEN}
                 st["schnittstellen"] = {"token": konf["TOKEN"], "pve_url": konf["PVE_URL"],
                                         "token_in_url": ja(konf["TOKEN_IN_URL"])}
                 st["sicherheit"] = {
                     "zwei_faktor_seit": zf.get("seit"), "notfall_uebrig": len(zf.get("notfall", [])),
-                    "sitzungen": self.anmeldung.angemeldet(), "nur_proxy": bool(self.proxies()), "https": self.https(),
-                    "ereignisse": letzte_ereignisse(15),
+                    "sitzungen": self.anmeldung.anzahl(ich), "nur_proxy": bool(self.proxies()), "https": self.https(),
+                    # Admins sehen alles, alle anderen nur ihre eigenen Einträge
+                    "ereignisse": letzte_ereignisse(20) if admin else letzte_ereignisse(15, wer=ich),
                 }
+                if admin:
+                    st["benutzer"] = benutzer_liste()
             return self.senden(200, st)
         if pfad == "/metrics":
             return self.senden(200, metriken(self.sammler.status()), "text/plain; version=0.0.4; charset=utf-8")
-        if pfad == "/api/anlegen" and sitzung:
+        if pfad == "/api/anlegen" and self.darf(sitzung, "bedienen"):
             try:
                 return self.senden(200, helfer("anlegen-optionen", timeout=90))
             except HelferFehler as e:
@@ -888,9 +993,12 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/auftrag/([0-9a-f-]+)", pfad)
         if m and sitzung and AUFTRAG_RE.match(m.group(1)):
             try:
-                return self.senden(200, helfer("auftrag", m.group(1), timeout=30))
+                job = helfer("auftrag", m.group(1), timeout=30)
             except HelferFehler as e:
                 return self.fehler(502, str(e))
+            if not self.darf(sitzung, "bedienen"):
+                job.pop("geheim", None)  # z. B. das Root-Passwort eines neuen Containers
+            return self.senden(200, job)
         return self.fehler(404, "nicht gefunden")
 
     # POST
@@ -917,41 +1025,64 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return self.fehler(400, "Ungültige Anfrage.")
         anmelde_schritte = {"/api/anmelden": self.anmelden, "/api/anmelden/code": self.anmelden_code,
+                            "/api/anmelden/neues-passwort": self.neues_passwort,
                             "/api/zwei-faktor/start": self.zf_start, "/api/zwei-faktor/bestaetigen": self.zf_bestaetigen}
         if pfad in anmelde_schritte:
             return anmelde_schritte[pfad](daten)
         if pfad == "/api/abmelden":
             self.anmeldung.ende(self.token_der_sitzung())
             return self.senden(200, {"ok": True}, kopf={"Set-Cookie": self.cookie("", 0)})
-        if not self.angemeldet():
+        s = self.angemeldet()
+        if not s:
             return self.fehler(401, "Bitte anmelden.")
-        aktionen = {"/api/aktion": self.aktion, "/api/host": self.host_aktion, "/api/auto": self.auto,
-                    "/api/alle": lambda d: self.alle_aktualisieren(), "/api/anlegen": self.anlegen,
-                    "/api/pruefung": self.pruefung, "/api/pruefen": self.pruefen,
-                    "/api/zwei-faktor/geraet": self.zf_geraet, "/api/zwei-faktor/notfallcodes": self.zf_notfallcodes,
-                    "/api/sitzungen/beenden": self.sitzungen_beenden}
+        # Pfad: (mindestens nötige Rolle, Funktion, ins Sicherheitsprotokoll)
+        aktionen = {
+            "/api/aktion": ("bedienen", self.aktion, True), "/api/host": ("bedienen", self.host_aktion, True),
+            "/api/auto": ("bedienen", self.auto, True), "/api/alle": ("bedienen", lambda d: self.alle_aktualisieren(), True),
+            "/api/anlegen": ("bedienen", self.anlegen, True), "/api/pruefung": ("bedienen", self.pruefung, True),
+            "/api/pruefen": ("lesen", self.pruefen, False),
+            "/api/zwei-faktor/geraet": ("lesen", self.zf_geraet, False),
+            "/api/zwei-faktor/notfallcodes": ("lesen", self.zf_notfallcodes, False),
+            "/api/sitzungen/beenden": ("lesen", self.sitzungen_beenden, False),
+            "/api/konto/passwort": ("lesen", self.konto_passwort, False),
+            "/api/benutzer/freigabe": ("admin", self.admin_freigabe, False),
+            "/api/benutzer/anlegen": ("admin", self.benutzer_neu, False),
+            "/api/benutzer/aendern": ("admin", self.benutzer_bearbeiten, False),
+            "/api/benutzer/passwort": ("admin", self.benutzer_passwort, False),
+            "/api/benutzer/zwei-faktor": ("admin", self.benutzer_zf, False),
+            "/api/benutzer/loeschen": ("admin", self.benutzer_loeschen, False),
+        }
         if pfad not in aktionen:
             return self.fehler(404, "nicht gefunden")
+        rolle, funktion, protokoll = aktionen[pfad]
+        if not self.darf(s, rolle):
+            ereignis(self.client_ip(), f"Nicht erlaubt: {pfad}", ok=False, wer=s["benutzer"])
+            return self.fehler(403, f"Dafür fehlt die Berechtigung (nötig: {ROLLEN[rolle]}).")
+        self.ich = s
+        kopf = None
         try:
-            erg = aktionen[pfad](daten)
+            erg = funktion(daten)
+            if isinstance(erg, tuple):
+                erg, kopf = erg
         except HelferFehler as e:
             return self.fehler(409, str(e))
+        except CodeNoetig as e:
+            return self.senden(403, {"fehler": str(e), "code_noetig": True})
         except Verweigert as e:
             return self.fehler(403, str(e))
         except (KeyError, TypeError, ValueError):
             return self.fehler(400, "Ungültige Anfrage.")
-        if pfad not in ("/api/pruefen", "/api/zwei-faktor/geraet", "/api/zwei-faktor/notfallcodes",
-                        "/api/sitzungen/beenden"):
-            ereignis(self.client_ip(), aktion_text(pfad, daten, self.sammler))
+        if protokoll:
+            ereignis(self.client_ip(), aktion_text(pfad, daten, self.sammler), wer=s["benutzer"])
         self.sammler.auftrag_eintragen(erg)
         self.sammler.wecker.set()
-        return self.senden(200, erg)
+        return self.senden(200, erg, kopf=kopf)
 
     def cookie(self, wert, alter):
         sicher = "; Secure" if self.https() else ""
         return f"ecspve={wert}; Path=/; Max-Age={alter}; HttpOnly; SameSite=Strict{sicher}"
 
-    # Anmeldung in zwei Schritten
+    # Anmeldung: Benutzer und Passwort, ggf. neues Passwort, dann Code
     def anmelde_sperre(self):
         art = self.anmeldung.gesperrt(self.client_ip())
         if art == "ip":
@@ -964,113 +1095,252 @@ class Anfrage(http.server.BaseHTTPRequestHandler):
         ip = self.client_ip()
         if self.proxies() and not self.https() and self.client_address[0] not in ("127.0.0.1", "::1"):
             return self.fehler(403, "Anmeldung nur über HTTPS.")
-        if not PASS_FILE.exists():
-            return self.fehler(503, "Noch kein Passwort gesetzt – im Container „ecspve passwort“ ausführen.")
+        if not benutzer_lesen()["benutzer"]:
+            return self.fehler(503, "Noch kein Benutzer angelegt – im Container „ecspve passwort“ ausführen.")
         sperre = self.anmelde_sperre()
         if sperre:
             return self.fehler(429, sperre)
-        if not passwort_pruefen(str(daten.get("passwort", ""))[:1024]):
-            self.fehlversuch("Passwort falsch")
-            return self.fehler(403, "Passwort falsch.")
-        token = self.anmeldung.neu("passwort", ip)
-        schritt = "code" if zf_laden() else "einrichten"
-        return self.senden(200, {"schritt": schritt}, kopf={"Set-Cookie": self.cookie(token, VORSTUFE_DAUER)})
+        name = str(daten.get("benutzer", "")).strip().lower()[:64]
+        u = anmeldung_pruefen(name, str(daten.get("passwort", ""))[:1024])
+        if not u:
+            self.fehlversuch(f"Anmeldung fehlgeschlagen ({name if NAME_RE.match(name) else 'unbekannter Name'})")
+            return self.fehler(403, "Benutzername oder Passwort falsch.")
+        if not u.get("aktiv", True):
+            self.fehlversuch("Anmeldung mit gesperrtem Zugang", wer=name)
+            return self.fehler(403, "Dieser Zugang ist gesperrt – bitte an einen Admin wenden.")
+        token = self.anmeldung.neu("passwort", ip, name)
+        return self.senden(200, {"schritt": naechster_schritt(u)}, kopf={"Set-Cookie": self.cookie(token, VORSTUFE_DAUER)})
 
-    def voll_anmelden(self, text):
+    def vorstufe(self):
+        """Sitzung nach richtigem Passwort (noch ohne Code) und ihr Benutzer."""
+        s = self.sitzung()
+        u = benutzer(s["benutzer"]) if s and s["stufe"] == "passwort" else None
+        return (s, u) if u else (None, None)
+
+    def neues_passwort(self, daten):
+        """Startpasswort durch ein eigenes ersetzen – vor allem anderen."""
+        s, u = self.vorstufe()
+        if not u or not u.get("muss_aendern"):
+            return self.fehler(401, "Bitte zuerst mit dem Startpasswort anmelden.")
+        neu = str(daten.get("passwort", ""))
+        if len(neu) < PASSWORT_MIN or len(neu) > 1024:
+            return self.fehler(400, f"Das neue Passwort braucht mindestens {PASSWORT_MIN} Zeichen.")
+        if hash_pruefen(u["hash"], neu):
+            return self.fehler(400, "Bitte ein anderes Passwort als das Startpasswort nehmen.")
+        name = s["benutzer"]
+        with benutzer_aendern() as d:
+            d["benutzer"][name].update(hash=passwort_hash(neu), muss_aendern=False, passwort_seit=time.time())
+        ereignis(self.client_ip(), "Startpasswort durch eigenes ersetzt", wer=name)
+        self.anmeldung.ende(self.token_der_sitzung())
+        token = self.anmeldung.neu("passwort", self.client_ip(), name)
+        return self.senden(200, {"schritt": naechster_schritt(benutzer(name))},
+                           kopf={"Set-Cookie": self.cookie(token, VORSTUFE_DAUER)})
+
+    def voll_anmelden(self, name, text):
         """Nach Passwort und zweitem Faktor: neue Sitzung (neues Token – das alte ist damit wertlos)."""
         ip = self.client_ip()
         self.anmeldung.ende(self.token_der_sitzung())
         self.anmeldung.erfolg(ip)
-        ereignis(ip, text)
+        with benutzer_aendern() as d:
+            if name in d["benutzer"]:
+                d["benutzer"][name]["letzte_anmeldung"] = time.time()
+        ereignis(ip, text, wer=name)
         if ja(lade_konfig()["MELDUNG_ANMELDUNG"]):
-            threading.Thread(target=melden, args=("Anmeldung an der Übersicht", f"{text} von {ip}"), daemon=True).start()
-        return self.cookie(self.anmeldung.neu("voll", ip), SITZUNG_HOECHSTENS)
+            threading.Thread(target=melden, args=("Anmeldung an der Übersicht", f"{name}: {text} von {ip}"),
+                             daemon=True).start()
+        return self.cookie(self.anmeldung.neu("voll", ip, name), SITZUNG_HOECHSTENS)
 
     def anmelden_code(self, daten):
-        s = self.sitzung()
-        if not s or s["stufe"] != "passwort" or not zf_laden():
+        s, u = self.vorstufe()
+        if not u or not u.get("zf"):
             return self.fehler(401, "Bitte zuerst das Passwort eingeben.")
+        if u.get("muss_aendern"):
+            return self.fehler(403, "Bitte zuerst ein eigenes Passwort festlegen.")
+        name = s["benutzer"]
         sperre = self.anmelde_sperre()
         if sperre:
             return self.fehler(429, sperre)
         if self.anmeldung.codes_gesperrt():
             return self.fehler(429, "Zu viele falsche Codes – die Anmeldung ist für eine Stunde gesperrt.")
-        art = code_pruefen(daten.get("code"), anmeldung=True)
+        art = code_pruefen(name, daten.get("code"), anmeldung=True)
         if not art:
             if self.anmeldung.falscher_code():
-                text = (f"{SPERRE_CODES} falsche Codes nach richtigem Passwort innerhalb einer Stunde – das Passwort ist "
-                        "vermutlich bekannt. Anmeldung für eine Stunde gesperrt. Bitte im Container „ecspve passwort“ "
-                        "ausführen.")
-                ereignis(self.client_ip(), text, ok=False)
+                text = (f"{SPERRE_CODES} falsche Codes nach richtigem Passwort innerhalb einer Stunde – ein Passwort "
+                        f"ist vermutlich bekannt (zuletzt „{name}“). Anmeldung für eine Stunde gesperrt. Bitte das "
+                        "Passwort ändern oder als Admin zurücksetzen.")
+                ereignis(self.client_ip(), text, ok=False, wer=name)
                 threading.Thread(target=melden, args=("Passwort der Übersicht vermutlich bekannt", text, True),
                                  daemon=True).start()
-            self.fehlversuch("Passwort richtig, Code falsch")
+            self.fehlversuch("Passwort richtig, Code falsch", wer=name)
             return self.fehler(403, "Code falsch oder schon benutzt – bitte den nächsten Code der App nehmen.")
-        cookie = self.voll_anmelden("Anmeldung mit Notfallcode" if art == "notfall" else "Anmeldung")
-        uebrig = len((zf_laden() or {}).get("notfall", []))
+        cookie = self.voll_anmelden(name, "Anmeldung mit Notfallcode" if art == "notfall" else "Anmeldung")
+        uebrig = len(((benutzer(name) or {}).get("zf") or {}).get("notfall", []))
         return self.senden(200, {"ok": True, "notfall": art == "notfall", "notfall_uebrig": uebrig},
                            kopf={"Set-Cookie": cookie})
 
     def zf_start(self, daten):
         """Neues Geheimnis für die App: beim ersten Mal nach dem Passwort, später nur mit gültigem Code."""
         s = self.sitzung()
-        if not s:
+        u = benutzer(s["benutzer"]) if s else None
+        if not u:
             return self.fehler(401, "Bitte anmelden.")
         if s["stufe"] == "voll":
-            if not code_pruefen(daten.get("code")):
-                self.fehlversuch("Code falsch (zweiten Faktor neu einrichten)")
+            if not code_pruefen(s["benutzer"], daten.get("code")):
+                self.fehlversuch("Code falsch (zweiten Faktor neu einrichten)", wer=s["benutzer"])
                 return self.fehler(403, "Code falsch.")
-        elif zf_laden():
+        elif u.get("muss_aendern"):
+            return self.fehler(403, "Bitte zuerst ein eigenes Passwort festlegen.")
+        elif u.get("zf"):
             return self.fehler(403, "Der zweite Faktor ist schon eingerichtet – bitte den Code eingeben.")
         s["neu_geheim"] = neues_geheimnis()
-        return self.senden(200, einrichtung(s["neu_geheim"]))
+        return self.senden(200, einrichtung(s["neu_geheim"], s["benutzer"]))
 
     def zf_bestaetigen(self, daten):
         s = self.sitzung()
-        if not s or not s.get("neu_geheim"):
+        if not s or not s.get("neu_geheim") or not benutzer(s["benutzer"]):
             return self.fehler(401, "Bitte die Einrichtung neu beginnen.")
         sperre = self.anmelde_sperre()
         if sperre:
             return self.fehler(429, sperre)
+        name = s["benutzer"]
         code = re.sub(r"\s", "", str(daten.get("code") or ""))
         schritt = totp_schritt(s["neu_geheim"], code) if re.fullmatch(r"[0-9]{6}", code) else None
         if schritt is None:
-            self.fehlversuch("Code falsch (Einrichtung des zweiten Faktors)")
+            self.fehlversuch("Code falsch (Einrichtung des zweiten Faktors)", wer=name)
             return self.fehler(403, "Der Code passt nicht. Stimmt die Uhrzeit auf dem Handy?")
         codes, hashes = neue_notfallcodes()
-        with ZF_LOCK:
-            zf_speichern({"geheim": s["neu_geheim"], "seit": time.time(), "letzter_schritt": schritt, "notfall": hashes})
-        # Alle bisherigen Sitzungen gelten ab jetzt nicht mehr (anmeldestand hat sich geändert)
-        cookie = self.voll_anmelden("Zweiter Faktor eingerichtet, angemeldet")
+        with benutzer_aendern() as d:
+            d["benutzer"][name]["zf"] = {"geheim": s["neu_geheim"], "seit": time.time(), "letzter_schritt": schritt,
+                                         "notfall": hashes}
+        # Alle bisherigen Sitzungen dieses Benutzers gelten ab jetzt nicht mehr (anmeldestand hat sich geändert)
+        cookie = self.voll_anmelden(name, "Zweiter Faktor eingerichtet, angemeldet")
         threading.Thread(target=melden, args=("Zweiter Faktor neu eingerichtet",
-                                              f"Neue Authenticator-App für die Übersicht, von {self.client_ip()}", True),
+                                              f"Neue Authenticator-App für „{name}“, von {self.client_ip()}", True),
                          daemon=True).start()
         return self.senden(200, {"notfallcodes": codes}, kopf={"Set-Cookie": cookie})
 
+    # Eigenes Konto
     def code_verlangen(self, daten, wofuer):
-        if not code_pruefen(daten.get("code")):
-            self.fehlversuch(f"Code falsch ({wofuer})")
+        if not code_pruefen(self.ich["benutzer"], daten.get("code")):
+            self.fehlversuch(f"Code falsch ({wofuer})", wer=self.ich["benutzer"])
             raise Verweigert("Code falsch.")
 
     def zf_geraet(self, daten):
         """QR-Code des bestehenden Geheimnisses für ein weiteres Handy – nur mit gültigem Code."""
         self.code_verlangen(daten, "weiteres Gerät")
-        ereignis(self.client_ip(), "QR-Code für ein weiteres Gerät angezeigt")
-        return einrichtung((zf_laden() or {})["geheim"])
+        name = self.ich["benutzer"]
+        ereignis(self.client_ip(), "QR-Code für ein weiteres Gerät angezeigt", wer=name)
+        return einrichtung(benutzer(name)["zf"]["geheim"], name)
 
     def zf_notfallcodes(self, daten):
         self.code_verlangen(daten, "neue Notfallcodes")
         codes, hashes = neue_notfallcodes()
-        with ZF_LOCK:
-            zf = zf_laden()
-            zf["notfall"] = hashes
-            zf_speichern(zf)
-        ereignis(self.client_ip(), "Neue Notfallcodes erzeugt – die alten gelten nicht mehr")
+        with benutzer_aendern() as d:
+            d["benutzer"][self.ich["benutzer"]]["zf"]["notfall"] = hashes
+        ereignis(self.client_ip(), "Neue Notfallcodes erzeugt – die alten gelten nicht mehr", wer=self.ich["benutzer"])
         return {"notfallcodes": codes}
 
     def sitzungen_beenden(self, daten):
-        self.anmeldung.alle_beenden(ausser=self.token_der_sitzung())
-        ereignis(self.client_ip(), "Alle anderen Sitzungen abgemeldet")
+        self.anmeldung.alle_beenden(self.ich["benutzer"], ausser=self.token_der_sitzung())
+        ereignis(self.client_ip(), "Alle anderen Sitzungen abgemeldet", wer=self.ich["benutzer"])
+        return {"ok": True}
+
+    def konto_passwort(self, daten):
+        """Eigenes Passwort ändern – meldet alle anderen Sitzungen ab, diese bekommt ein neues Token."""
+        name = self.ich["benutzer"]
+        alt, neu = str(daten.get("alt", ""))[:1024], str(daten.get("neu", ""))
+        if not hash_pruefen(benutzer(name)["hash"], alt):
+            self.fehlversuch("Bisheriges Passwort falsch (Passwort ändern)", wer=name)
+            raise Verweigert("Das bisherige Passwort stimmt nicht.")
+        if len(neu) < PASSWORT_MIN or len(neu) > 1024:
+            raise Verweigert(f"Das neue Passwort braucht mindestens {PASSWORT_MIN} Zeichen.")
+        with benutzer_aendern() as d:
+            d["benutzer"][name].update(hash=passwort_hash(neu), muss_aendern=False, passwort_seit=time.time())
+        ereignis(self.client_ip(), "Eigenes Passwort geändert – alle anderen Sitzungen abgemeldet", wer=name)
+        self.anmeldung.ende(self.token_der_sitzung())
+        return {"ok": True}, {"Set-Cookie": self.cookie(self.anmeldung.neu("voll", self.client_ip(), name),
+                                                        SITZUNG_HOECHSTENS)}
+
+    # Benutzerverwaltung (nur Admins, nur nach frisch bestätigtem Code)
+    def admin_freigabe(self, daten):
+        self.code_verlangen(daten, "Benutzerverwaltung freischalten")
+        self.ich["freigabe_bis"] = time.time() + FREIGABE_DAUER
+        return {"ok": True, "bis": self.ich["freigabe_bis"]}
+
+    def freigabe_pruefen(self):
+        if self.ich.get("freigabe_bis", 0) < time.time():
+            raise CodeNoetig("Zum Verwalten von Benutzern bitte einmal den Code aus deiner App eingeben.")
+
+    def ziel(self, daten, auch_selbst=False):
+        name = str(daten.get("name", "")).strip().lower()
+        if not benutzer(name):
+            raise Verweigert(f"Den Benutzer „{name[:64]}“ gibt es nicht.")
+        if name == self.ich["benutzer"] and not auch_selbst:
+            raise Verweigert("Für den eigenen Zugang bitte „Sicherheit“ benutzen.")
+        return name
+
+    def benutzer_neu(self, daten):
+        self.freigabe_pruefen()
+        name, rolle = str(daten.get("name", "")).strip().lower(), daten.get("rolle", "bedienen")
+        if not NAME_RE.match(name):
+            raise Verweigert("Benutzername: 2–64 Zeichen, Kleinbuchstaben, Ziffern und . _ @ - (z. B. max.muster).")
+        if rolle not in ROLLEN:
+            raise ValueError(rolle)
+        start = neues_startpasswort()
+        with benutzer_aendern() as d:
+            if name in d["benutzer"]:
+                raise Verweigert(f"Den Benutzer „{name}“ gibt es schon.")
+            d["benutzer"][name] = {"rolle": rolle, "hash": passwort_hash(start), "aktiv": True, "erstellt": time.time(),
+                                   "muss_aendern": True, "zf": None, "von": self.ich["benutzer"]}
+        ereignis(self.client_ip(), f"Benutzer „{name}“ angelegt ({ROLLEN[rolle]})", wer=self.ich["benutzer"])
+        threading.Thread(target=melden, args=("Neuer Benutzer an der Übersicht",
+                                              f"„{name}“ ({ROLLEN[rolle]}), angelegt von {self.ich['benutzer']}",
+                                              rolle == "admin"), daemon=True).start()
+        return {"name": name, "passwort": start}
+
+    def benutzer_bearbeiten(self, daten):
+        """Rolle ändern oder Zugang sperren/entsperren."""
+        self.freigabe_pruefen()
+        name = self.ziel(daten)
+        with benutzer_aendern() as d:
+            u = d["benutzer"][name]
+            if "rolle" in daten:
+                if daten["rolle"] not in ROLLEN:
+                    raise ValueError(daten["rolle"])
+                u["rolle"] = daten["rolle"]
+            if "aktiv" in daten:
+                u["aktiv"] = bool(daten["aktiv"])
+            admin_bleibt(d)
+            text = f"Benutzer „{name}“: {ROLLEN[u['rolle']]}, {'aktiv' if u.get('aktiv', True) else 'gesperrt'}"
+        ereignis(self.client_ip(), text, wer=self.ich["benutzer"])
+        return {"ok": True}
+
+    def benutzer_passwort(self, daten):
+        """Neues Startpasswort – meldet den Benutzer überall ab, er setzt bei der nächsten Anmeldung ein eigenes."""
+        self.freigabe_pruefen()
+        name = self.ziel(daten)
+        start = neues_startpasswort()
+        with benutzer_aendern() as d:
+            d["benutzer"][name].update(hash=passwort_hash(start), muss_aendern=True)
+        ereignis(self.client_ip(), f"Passwort von „{name}“ zurückgesetzt", wer=self.ich["benutzer"])
+        return {"name": name, "passwort": start}
+
+    def benutzer_zf(self, daten):
+        """Zweiten Faktor zurücksetzen (Handy verloren) – bei der nächsten Anmeldung neu einrichten."""
+        self.freigabe_pruefen()
+        name = self.ziel(daten)
+        with benutzer_aendern() as d:
+            d["benutzer"][name]["zf"] = None
+        ereignis(self.client_ip(), f"Zweiter Faktor von „{name}“ zurückgesetzt", wer=self.ich["benutzer"])
+        return {"ok": True}
+
+    def benutzer_loeschen(self, daten):
+        self.freigabe_pruefen()
+        name = self.ziel(daten)
+        with benutzer_aendern() as d:
+            del d["benutzer"][name]
+            admin_bleibt(d)
+        ereignis(self.client_ip(), f"Benutzer „{name}“ gelöscht", wer=self.ich["benutzer"])
         return {"ok": True}
 
     def pruefen(self, daten):
@@ -1161,6 +1431,10 @@ class Verweigert(Exception):
     pass
 
 
+class CodeNoetig(Verweigert):
+    pass
+
+
 def aktion_text(pfad, daten, sammler):
     """Kurze Beschreibung einer Aktion für das Sicherheitsprotokoll."""
     namen = {g["id"]: g["name"] for g in sammler.status()["gaeste"]}
@@ -1198,8 +1472,15 @@ def serve():
     Anfrage.sammler, Anfrage.anmeldung = sammler, Anmeldung()
     server = Webserver((konf["ADRESSE"], int(konf["PORT"])), Anfrage)
     log(f"ecspve {VERSION} hört auf http://{konf['ADRESSE']}:{konf['PORT']}")
-    if not PASS_FILE.exists():
-        log("Hinweis: noch kein Passwort gesetzt – „ecspve passwort“ ausführen.")
+    if not BENUTZER_FILE.exists():
+        # Bisherigen einzelnen Zugang (Passwort und App) einmalig als Benutzer „admin“ übernehmen
+        with benutzer_aendern() as d:
+            pass
+        if d["benutzer"]:
+            log("Bisherigen Zugang als Benutzer „admin“ übernommen.")
+            ZF_FILE.unlink(missing_ok=True)
+    if not benutzer_lesen()["benutzer"]:
+        log("Hinweis: noch kein Benutzer – „ecspve passwort“ legt den Admin an.")
     server.serve_forever()
 
 
@@ -1302,49 +1583,107 @@ def setze_konfig(schluessel, wert):
     tmp.replace(CONF_FILE)
 
 
-def cmd_passwort(args):
+def passwort_eingeben(args, frage):
     if "--stdin" in args:
         passwort = sys.stdin.readline().rstrip("\n")
     else:
-        passwort = getpass.getpass(f"Neues Passwort für die Übersicht (mind. {PASSWORT_MIN} Zeichen): ")
+        passwort = getpass.getpass(f"{frage} (mind. {PASSWORT_MIN} Zeichen): ")
         if getpass.getpass("Wiederholen: ") != passwort:
             sys.exit("Die Passwörter stimmen nicht überein.")
     if len(passwort) < PASSWORT_MIN:
         sys.exit(f"Das Passwort muss mindestens {PASSWORT_MIN} Zeichen lang sein.")
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = PASS_FILE.with_suffix(".tmp")
-    tmp.write_text(passwort_hash(passwort) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o640)
-    try:
-        os.chown(tmp, 0, grp.getgrnam("ecspve").gr_gid)
-    except (KeyError, PermissionError):
-        pass
-    tmp.replace(PASS_FILE)
-    ereignis("Kommandozeile", "Passwort neu gesetzt – alle Sitzungen abgemeldet")
-    print("Passwort gesetzt. Alle Sitzungen sind damit abgemeldet.")
+    return passwort
+
+
+def cmd_passwort(args):
+    """Passwort von „admin“ (oder --benutzer=NAME) setzen – legt den Admin an, wenn es noch keinen gibt."""
+    name = next((a.split("=", 1)[1] for a in args if a.startswith("--benutzer=")), "admin").strip().lower()
+    if not NAME_RE.match(name):
+        sys.exit("Ungültiger Benutzername.")
+    passwort = passwort_eingeben(args, f"Neues Passwort für „{name}“")
+    with benutzer_aendern() as d:
+        u = d["benutzer"].setdefault(name, {"rolle": "admin", "aktiv": True, "erstellt": time.time(), "zf": None})
+        u.update(hash=passwort_hash(passwort), muss_aendern=False, passwort_seit=time.time())
+    ereignis("Kommandozeile", f"Passwort von „{name}“ neu gesetzt – alle Sitzungen abgemeldet", wer=name)
+    print(f"Passwort für „{name}“ gesetzt. Alle Sitzungen von „{name}“ sind damit abgemeldet.")
 
 
 def cmd_zwei_faktor(args):
-    zf = zf_laden()
     if args[:1] == ["zuruecksetzen"]:
-        if not zf:
-            print("Der zweite Faktor ist nicht eingerichtet – bei der nächsten Anmeldung wird er eingerichtet.")
-            return 0
-        ZF_FILE.unlink()
-        ereignis("Kommandozeile", "Zweiter Faktor zurückgesetzt – alle Sitzungen abgemeldet", ok=False)
-        melden("Zweiter Faktor zurückgesetzt", "Auf der Kommandozeile im Container der Übersicht. Bei der nächsten "
-               "Anmeldung wird eine neue Authenticator-App eingerichtet.", True)
-        print("Zurückgesetzt. Bei der nächsten Anmeldung (Passwort) wird eine neue Authenticator-App eingerichtet.")
+        name = (args[1] if len(args) > 1 else "admin").lower()
+        with benutzer_aendern() as d:
+            if name not in d["benutzer"]:
+                sys.exit(f"Den Benutzer „{name}“ gibt es nicht (Liste: ecspve benutzer).")
+            d["benutzer"][name]["zf"] = None
+        ereignis("Kommandozeile", f"Zweiter Faktor von „{name}“ zurückgesetzt", ok=False, wer=name)
+        melden("Zweiter Faktor zurückgesetzt", f"Für „{name}“, auf der Kommandozeile im Container der Übersicht. "
+               "Bei der nächsten Anmeldung wird eine neue Authenticator-App eingerichtet.", True)
+        print(f"Zurückgesetzt. „{name}“ richtet bei der nächsten Anmeldung eine neue Authenticator-App ein.")
         return 0
     if args:
-        print(f"Unbekannt: {' '.join(args)} – möglich ist: ecspve zwei-faktor zuruecksetzen", file=sys.stderr)
+        print("Möglich ist: ecspve zwei-faktor zuruecksetzen [NAME]", file=sys.stderr)
         return 2
-    if not zf:
-        print("Zweiter Faktor: noch nicht eingerichtet – das passiert bei der nächsten Anmeldung.")
-    else:
-        print(f"Zweiter Faktor: eingerichtet seit {time.strftime('%d.%m.%Y %H:%M', time.localtime(zf['seit']))}, "
-              f"{len(zf.get('notfall', []))} Notfallcodes übrig.")
+    return cmd_benutzer([])
+
+
+def cmd_benutzer(args):
+    """Benutzer auf der Kommandozeile verwalten – für den Notfall oder ohne Weboberfläche."""
+    if not args:
+        liste = benutzer_liste()
+        if not liste:
+            print("Noch keine Benutzer – „ecspve passwort“ legt den Admin an.")
+        for u in liste:
+            zf = f"zweiter Faktor ✔ ({u['notfall_uebrig']} Notfallcodes)" if u["zwei_faktor"] else "zweiter Faktor fehlt"
+            zuletzt = (time.strftime("%d.%m.%Y %H:%M", time.localtime(u["letzte_anmeldung"]))
+                       if u["letzte_anmeldung"] else "nie")
+            print(f"{u['name']:<24} {ROLLEN.get(u['rolle'], u['rolle']):<12} {'aktiv' if u['aktiv'] else 'GESPERRT':<9}"
+                  f" {zf:<34} zuletzt angemeldet: {zuletzt}")
+        return 0
+    befehl, name = args[0], (args[1].lower() if len(args) > 1 else "")
+    if not NAME_RE.match(name):
+        print(__doc__, file=sys.stderr)
+        return 2
+    if befehl == "anlegen":
+        rolle = next((a.split("=", 1)[1] for a in args[2:] if a.startswith("--rolle=")), "bedienen")
+        if rolle not in ROLLEN:
+            sys.exit(f"Rolle: {', '.join(ROLLEN)}")
+        start = neues_startpasswort()
+        with benutzer_aendern() as d:
+            if name in d["benutzer"]:
+                sys.exit(f"Den Benutzer „{name}“ gibt es schon.")
+            d["benutzer"][name] = {"rolle": rolle, "hash": passwort_hash(start), "aktiv": True, "erstellt": time.time(),
+                                   "muss_aendern": True, "zf": None, "von": "Kommandozeile"}
+        ereignis("Kommandozeile", f"Benutzer „{name}“ angelegt ({ROLLEN[rolle]})")
+        print(f"Angelegt: {name} ({ROLLEN[rolle]})\nStartpasswort: {start}\n"
+              "Bei der ersten Anmeldung wird es durch ein eigenes ersetzt und der zweite Faktor eingerichtet.")
+        return 0
+    with benutzer_aendern() as d:
+        if name not in d["benutzer"]:
+            sys.exit(f"Den Benutzer „{name}“ gibt es nicht (Liste: ecspve benutzer).")
+        u = d["benutzer"][name]
+        if befehl == "passwort":
+            u.update(hash=passwort_hash(passwort_eingeben(args, f"Neues Passwort für „{name}“")), muss_aendern=False)
+        elif befehl == "rolle" and len(args) > 2 and args[2] in ROLLEN:
+            u["rolle"] = args[2]
+        elif befehl in ("sperren", "entsperren"):
+            u["aktiv"] = befehl == "entsperren"
+        elif befehl == "zwei-faktor":
+            u["zf"] = None
+        elif befehl == "loeschen":
+            del d["benutzer"][name]
+        else:
+            sys.exit(f"Unbekannt: {' '.join(args)}\n{__doc__}")
+        admin_bleibt_cli(d)
+    ereignis("Kommandozeile", f"Benutzer „{name}“: {' '.join(args[:1] + args[2:3])}")
+    print("Erledigt.")
     return 0
+
+
+def admin_bleibt_cli(daten):
+    try:
+        admin_bleibt(daten)
+    except Verweigert as e:
+        sys.exit(str(e))
 
 
 def cmd_token(args):
@@ -1410,6 +1749,8 @@ def main():
         cmd_token(rest)
     elif befehl == "zwei-faktor":
         return cmd_zwei_faktor(rest)
+    elif befehl == "benutzer":
+        return cmd_benutzer(rest)
     elif befehl == "ping":
         return cmd_ping()
     elif befehl == "verbindung":
