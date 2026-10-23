@@ -86,6 +86,9 @@ class Pruefskript(unittest.TestCase):
         # StreetworkDoc ohne Projektordner auf dem Host: kein App-Update eingerichtet
         self.assertFalse(erg["105"]["app_update"])
         self.assertEqual(erg["120"]["apps"], [])
+        # Typische Ausfälle in unprivilegierten Containern sind keine Störung
+        caddy = {d["name"]: d["zustand"] for d in erg["120"]["dienste"]}
+        self.assertEqual((caddy["tmp.mount"], caddy["run-lock.mount"], caddy["caddy.service"]), ("ruhe", "ruhe", "ok"))
 
     def test_app_update_befehle(self):
         konf = {"STREETWORKDOC_QUELLE": "/gibt/es/nicht"}

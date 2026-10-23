@@ -64,7 +64,8 @@ GAESTE = {
           "befehl_ok": True},
     120: {"name": "caddy", "mem": 0.11, "disk": 0.20, "cpu": 0.002, "uptime": 1_210_500,
           "os": "Debian GNU/Linux 12 (bookworm)", "ip": "192.168.10.2", "updates": 2,
-          "einheiten": [einheit("caddy.service")]},
+          "einheiten": [einheit("caddy.service"), einheit("tmp.mount", "failed", "failed", "", "static"),
+                        einheit("run-lock.mount", "failed", "failed", "", "static")]},
     200: {"name": "testserver", "typ": "qemu", "status": "stopped"},
     9000: {"name": "debian-13-vorlage", "status": "stopped", "template": True},
 }

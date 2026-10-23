@@ -57,6 +57,10 @@ PFAD = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 AUFTRAG_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 DIENST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]{0,120}\.service$")
+# Darf systemd in unprivilegierten LXC-Containern oft nicht einhängen – fällt dort aus, ohne dass etwas fehlt
+LXC_HARMLOS = {"dev-mqueue.mount", "run-lock.mount", "tmp.mount", "sys-kernel-config.mount", "sys-kernel-debug.mount",
+               "sys-kernel-tracing.mount", "sys-fs-fuse-connections.mount", "proc-sys-fs-binfmt_misc.automount",
+               "systemd-journald-audit.socket"}
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 VORLAGE_RE = re.compile(r"^debian-1[2-9]-standard_.*_amd64\.tar\.(zst|gz|xz)$")
 STROM = {"start": "Starten", "herunterfahren": "Herunterfahren", "neustart": "Neustart", "stopp": "Ausschalten"}
@@ -430,7 +434,10 @@ def werte_probe_aus(text):
             namen.add(d["name"])
             erg["dienste"].append(d)
     for name in failed:
-        if name not in namen:
+        if name in LXC_HARMLOS:
+            erg["dienste"].append({"name": name, "zustand": "ruhe",
+                                   "text": "ausgefallen – im unprivilegierten Container üblich und harmlos"})
+        elif name not in namen:
             erg["dienste"].append({"name": name, "zustand": "fehler", "text": "failed"})
     rang = {"fehler": 0, "ok": 1, "ruhe": 2}
     erg["dienste"].sort(key=lambda d: (rang.get(d["zustand"], 3), d["name"].endswith(".timer"), d["name"]))
