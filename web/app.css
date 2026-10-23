@@ -91,10 +91,29 @@ button.leise:hover { color: var(--text); }
   background: var(--karte); border-bottom: 1px solid var(--linie);
   position: sticky; top: 0; z-index: 5;
 }
-.marke { display: flex; align-items: center; gap: .7rem; min-width: 0; }
-.marke h1 { white-space: nowrap; }
-.marke p { color: var(--leise); font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kopf-rechts { display: flex; align-items: center; gap: .5rem; flex-shrink: 0; }
+.marke { display: flex; align-items: center; gap: .7rem; min-width: 0; flex: 1 1 auto; }
+.marke img { flex-shrink: 0; }
+.marke > div { min-width: 0; }
+.marke h1, .marke p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.marke p { color: var(--leise); font-size: .85rem; }
+.kopf-rechts { display: flex; align-items: center; gap: .6rem; flex-shrink: 0; }
+button.pille { border: 0; font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer; }
+.pille .kurz { display: none; }
+/* Konto-Menü oben rechts */
+.konto { position: relative; }
+.konto summary { list-style: none; display: flex; align-items: center; gap: .5rem; cursor: pointer;
+  padding: .2rem .55rem .2rem .2rem; border-radius: 999px; border: 1px solid transparent; }
+.konto summary::-webkit-details-marker { display: none; }
+.konto summary:hover, .konto[open] summary { border-color: var(--linie); }
+.avatar { width: 2rem; height: 2rem; border-radius: 50%; display: grid; place-items: center; flex-shrink: 0;
+  background: color-mix(in srgb, var(--akzent) 18%, transparent); color: var(--akzent); font-weight: 700; font-size: .78rem; }
+.konto-name { font-size: .875rem; color: var(--leise); max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.konto .liste { position: absolute; right: 0; top: calc(100% + 6px); min-width: 15rem; max-width: calc(100vw - 32px);
+  background: var(--karte); border: 1px solid var(--linie); border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, .18);
+  padding: .3rem; display: grid; z-index: 10; }
+.konto .liste button { border: 0; text-align: left; border-radius: 6px; background: transparent; padding: .5rem .7rem; }
+.konto .liste button:hover { background: var(--fein); }
+.konto-kopf { display: grid; gap: .1rem; padding: .5rem .7rem .6rem; margin-bottom: .25rem; border-bottom: 1px solid var(--fein); overflow-wrap: anywhere; }
 
 main { max-width: 1240px; margin: 0 auto; padding: 1.25rem 16px 3rem; display: grid; gap: 1.25rem; }
 .karte { background: var(--karte); border: 1px solid var(--linie); border-radius: 12px; padding: 1rem 1.1rem; box-shadow: var(--schatten); min-width: 0; }
@@ -112,7 +131,7 @@ main { max-width: 1240px; margin: 0 auto; padding: 1.25rem 16px 3rem; display: g
 .pille.warn { background: var(--warn-hg); color: var(--warn); }
 
 /* Meldungen */
-#meldungen { display: grid; gap: .6rem; }
+#meldungen { display: grid; gap: .6rem; scroll-margin-top: 84px; }
 #meldungen:empty { display: none; }
 .meldung { border-radius: 10px; padding: .7rem .9rem; border: 1px solid; }
 .meldung h3 { font-size: .9rem; margin-bottom: .3rem; }
@@ -284,8 +303,14 @@ fieldset.wahl legend { font-size: .85rem; font-weight: 600; padding: 0 .3rem; }
 #toast.zeigen { opacity: 1; }
 
 @media (max-width: 640px) {
-  .kopf { padding-top: .7rem; padding-bottom: .7rem; }
+  .kopf { padding-top: .6rem; padding-bottom: .6rem; gap: .6rem; }
+  .marke { gap: .5rem; }
+  .marke img { width: 28px; height: 28px; }
+  .marke h1 { font-size: 1.05rem; }
   .marke p { display: none; }
+  .pille .lang, .konto-name { display: none; }
+  .pille .kurz { display: inline; }
+  .konto summary { padding: 0; }
   .schnitt-zeile { grid-template-columns: minmax(0, 1fr) auto; }
   .schnitt-zeile strong { grid-column: 1 / -1; }
   .gast .messwerte { grid-template-columns: repeat(3, minmax(0, 1fr)); }

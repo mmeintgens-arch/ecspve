@@ -8,7 +8,7 @@ steht: Container-IDs und Dienstnamen werden geprüft, freie Befehle gibt es nich
   ecspve-helfer uebersicht                     Host, Gäste und letzte Aufträge (JSON)
   ecspve-helfer pruefen                        Dienste, Funktionsprüfung und Updates aller laufenden Container
   ecspve-helfer start|herunterfahren|neustart|stopp ID
-  ecspve-helfer update ID alles|system|app [--snapshots=N] [--neustart]
+  ecspve-helfer update ID alles|system|app [--snapshots=N] [--snapshots-loeschen] [--neustart]
   ecspve-helfer dienst ID NAME.service         einen Dienst im Container neu starten
   ecspve-helfer host-update                    Proxmox-Host aktualisieren (apt-get dist-upgrade)
   ecspve-helfer auffrischen                    Paketlisten in allen laufenden Containern neu laden
@@ -682,6 +682,16 @@ def snapshot(gid, behalten, log):
     return None
 
 
+def snapshots_loeschen(gid, log):
+    """Nach einem erfolgreichen Update: die Snapshots von ecspve (ecspve_…) wieder weg – eigene bleiben."""
+    alte = sorted(s for s in gast_conf(KNOTEN, "lxc", gid)["snapshots"] if s.startswith("ecspve_"))
+    if not alte:
+        return 0, []
+    log.abschnitt("Update erfolgreich – Snapshots löschen")
+    fehler = [s for s in alte if log.befehl(["pct", "delsnapshot", gid, s], timeout=1800)]
+    return len(alte) - len(fehler), fehler
+
+
 def stoerungen(erg):
     teile = [f"Dienst {d['name']}" for d in erg.get("dienste", []) if d["zustand"] == "fehler"]
     teile += [f"Prüfung {p['app']} ({p['detail']})" for p in erg.get("pruefungen", []) if not p["ok"]]
@@ -736,6 +746,12 @@ def a_update(job, log):
     job_hinweise(job, hinweise)
     if probleme:
         return "warnung", "Aktualisiert, aber gestört: " + ", ".join(probleme)
+    if p.get("snapshots_loeschen"):
+        weg, fehler = snapshots_loeschen(gid, log)
+        if fehler:
+            warnungen.append(f"Snapshot {', '.join(fehler)} ließ sich nicht löschen.")
+        elif weg:
+            hinweise.append("Snapshot gelöscht" if weg == 1 else f"{weg} Snapshots gelöscht")
     if warnungen:
         return "warnung", "Aktualisiert. " + " ".join(warnungen)
     return "ok", "Aktualisiert" + (f" – {', '.join(hinweise)}" if hinweise else "")
@@ -973,10 +989,12 @@ def befehl(argv, intern):
         gid, typ = lokaler_gast(args[0])
         if typ != "lxc":
             raise Fehler("Updates gibt es nur für Container (LXC).")
-        param = {"was": args[1], "snapshots": 0, "neustart": False}
+        param = {"was": args[1], "snapshots": 0, "snapshots_loeschen": False, "neustart": False}
         for opt in args[2:]:
             if re.fullmatch(r"--snapshots=[0-9]", opt):
                 param["snapshots"] = int(opt.split("=")[1])
+            elif opt == "--snapshots-loeschen":
+                param["snapshots_loeschen"] = True
             elif opt == "--neustart":
                 param["neustart"] = True
             else:

@@ -19,9 +19,15 @@
     </div>
   </div>
   <div class="kopf-rechts">
-    <span id="gesamt" class="pille" hidden></span>
-    <span id="wer" class="leise-text" hidden></span>
-    <button id="abmelden" class="leise" type="button" hidden>Abmelden</button>
+    <button id="gesamt" class="pille" type="button" hidden><span class="lang"></span><span class="kurz"></span></button>
+    <details id="konto-menue" class="konto" hidden>
+      <summary aria-label="Konto"><span id="avatar" class="avatar" aria-hidden="true"></span><span id="wer" class="konto-name"></span></summary>
+      <div class="liste">
+        <p class="konto-kopf"><strong id="konto-name"></strong><span id="konto-rolle" class="leise-text"></span></p>
+        <button id="konto-passwort" type="button">Passwort ändern</button>
+        <button id="abmelden" type="button">Abmelden</button>
+      </div>
+    </details>
   </div>
 </header>
 

@@ -145,6 +145,20 @@ class HelferBefehle(unittest.TestCase):
         rc, mit_log = helfer_aufruf("auftrag", job["id"])
         self.assertIn("turnierapp-update", mit_log["protokoll"])
 
+    def test_snapshots_nach_erfolg_loeschen(self):
+        conf = ORDNER / "pve/nodes/pve/lxc/103.conf"
+        conf.write_text(conf.read_text() + "\n[vor-umbau]\ndescription: eigener Snapshot\n")
+        rc, job = helfer_aufruf("update", "103", "system", "--snapshots=2", "--snapshots-loeschen")
+        fertig = warte_auf_auftrag(job["id"])
+        self.assertEqual(fertig["status"], "ok", fertig)
+        self.assertIn("Snapshot gelöscht", fertig["ergebnis"])
+        self.assertEqual(helfer.gast_conf("pve", "lxc", 103)["snapshots"], ["vor-umbau"])  # eigene bleiben
+        # danach gestört (eventcrew-worker ausgefallen): der Snapshot bleibt für ein Rollback
+        rc, job = helfer_aufruf("update", "104", "system", "--snapshots=2", "--snapshots-loeschen")
+        fertig = warte_auf_auftrag(job["id"], 90)
+        self.assertEqual(fertig["status"], "warnung", fertig)
+        self.assertEqual(len(helfer.gast_conf("pve", "lxc", 104)["snapshots"]), 1)
+
     def test_anlegen(self):
         rc, d = helfer_aufruf("anlegen-optionen")
         self.assertEqual(d["bruecken"], ["vmbr0", "vmbr1"])

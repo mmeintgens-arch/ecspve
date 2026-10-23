@@ -134,8 +134,8 @@
     for (const d of document.querySelectorAll("dialog[open]")) d.close();
     $("inhalt").hidden = true;
     $("gesamt").hidden = true;
-    $("abmelden").hidden = true;
-    $("wer").hidden = true;
+    $("konto-menue").open = false;
+    $("konto-menue").hidden = true;
     $("anmeldung").hidden = false;
     // Nach dem Neuladen im richtigen Schritt weitermachen
     let s = { stufe: null };
@@ -173,11 +173,16 @@
   function zeigeInhalt() {
     $("anmeldung").hidden = true;
     $("inhalt").hidden = false;
-    $("abmelden").hidden = false;
     $("gesamt").hidden = false;
     if (stand && stand.ich) {
-      $("wer").hidden = false;
-      $("wer").textContent = `${stand.ich.name} · ${stand.ich.rollen[stand.ich.rolle] || stand.ich.rolle}`;
+      const name = stand.ich.name;
+      const teile = name.split(/[._@-]+/).filter(Boolean);
+      $("avatar").textContent = (teile.length > 1 ? teile[0][0] + teile[1][0] : name.slice(0, 2)).toUpperCase();
+      $("wer").textContent = name;
+      $("konto-name").textContent = name;
+      $("konto-rolle").textContent = stand.ich.rollen[stand.ich.rolle] || stand.ich.rolle;
+      $("konto-menue").title = `${name} · ${stand.ich.rollen[stand.ich.rolle] || stand.ich.rolle}`;
+      $("konto-menue").hidden = false;
     }
   }
 
@@ -191,10 +196,14 @@
     $("untertitel").textContent = host.name
       ? `${host.name} · Proxmox VE ${host.pve || "?"} · Stand ${uhr}`
       : "Übersicht der Container und Dienste";
+    const n = stand.probleme.length;
+    const [art, lang, kurz] = !stand.verbunden ? ["fehler", "Keine Verbindung", "Offline"]
+      : stand.ok ? ["ok", "Alles in Ordnung", "Alles OK"] : ["fehler", `${n} ${n === 1 ? "Problem" : "Probleme"}`, `${n} ${n === 1 ? "Problem" : "Probleme"}`];
     const g = $("gesamt");
-    if (!stand.verbunden) { g.className = "pille fehler"; g.textContent = "Keine Verbindung"; }
-    else if (stand.ok) { g.className = "pille ok"; g.textContent = "Alles in Ordnung"; }
-    else { g.className = "pille fehler"; g.textContent = `${stand.probleme.length} ${stand.probleme.length === 1 ? "Problem" : "Probleme"}`; }
+    g.className = `pille ${art}`;
+    g.querySelector(".lang").textContent = lang;
+    g.querySelector(".kurz").textContent = kurz;
+    g.title = stand.ok ? "Alles in Ordnung" : "Zu den Meldungen springen";
     $("pruefstand").textContent = stand.proben_stand ? `Dienste geprüft ${zeit(stand.proben_stand)}` : "Dienste werden geprüft …";
     meldungen();
     hostKarte(host);
@@ -653,7 +662,9 @@
         n.ergebnisse.length ? h("ul", { class: "nacht-liste" }, n.ergebnisse.map((r) =>
           h("li", {}, h("span", { class: `status-${r.status}` }, `${ZEICHEN[r.status] || "?"} `), `${r.titel}: ${r.ergebnis}`))) : null] : null,
       h("p", { class: "einstellungen" },
-        `Snapshot vor jedem Update: ${e.snapshots ? `ja, die letzten ${e.snapshots} bleiben` : "nein"} · `,
+        `Snapshot vor jedem Update: ${!e.snapshots ? "nein" : e.snapshots_loeschen
+          ? `ja, nach erfolgreichem Update wieder gelöscht (sonst bleiben die letzten ${e.snapshots})`
+          : `ja, die letzten ${e.snapshots} bleiben`} · `,
         `Neustart, wenn ein Update es verlangt: ${e.neustart ? "ja" : "nein"} · `,
         `Proxmox-Host nachts: ${n.host_auto ? "ja" : "nein"} – einstellbar in `, h("code", {}, "/etc/ecspve/ecspve.env")),
       darf("bedienen") ? h("p", { class: "einstellungen" }, h("button", { type: "button", onclick: auffrischen }, "Paketlisten jetzt neu laden")) : null));
@@ -703,7 +714,8 @@
   }
   function update(g, was) {
     const e = stand.einstellungen || {};
-    const snap = e.snapshots ? "\n\nVorher wird ein Snapshot angelegt (falls der Speicher das kann)." : "";
+    const snap = !e.snapshots ? "" : "\n\nVorher wird ein Snapshot angelegt (falls der Speicher das kann)"
+      + (e.snapshots_loeschen ? " – nach erfolgreichem Update wird er wieder gelöscht." : ".");
     if (!confirm(`„${g.name}“ aktualisieren (${WAS[was]})?${snap}`)) return;
     auftrag("/api/aktion", { id: g.id, aktion: "update", was }, `${g.name}: Update eingeplant`);
   }
@@ -887,8 +899,20 @@
     });
     $("zf-form").addEventListener("submit", zfAbschicken);
     $("abmelden").addEventListener("click", async () => {
+      $("konto-menue").open = false;
       try { await api("/api/abmelden", {}); } catch (e) { /* egal */ }
       zeigeAnmeldung();
+    });
+    $("konto-passwort").addEventListener("click", () => { $("konto-menue").open = false; kontoOeffnen(); });
+    $("gesamt").addEventListener("click", () => {
+      if (stand && !stand.ok) $("meldungen").scrollIntoView({ behavior: "smooth", block: "start" });
+      else window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    // Offene Menüs (Konto, „Mehr“) schließen, sobald woanders hingeklickt wird
+    document.addEventListener("click", (ev) => {
+      for (const d of document.querySelectorAll("details.konto[open], details.menue[open]")) {
+        if (!d.contains(ev.target)) d.open = false;
+      }
     });
     $("pruefen").addEventListener("click", () => auftrag("/api/pruefen", {}, "Prüfung läuft – Ergebnis in etwa einer Minute"));
     $("alle").addEventListener("click", alleAktualisieren);

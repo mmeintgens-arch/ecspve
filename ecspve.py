@@ -60,7 +60,7 @@ SICHERHEIT_FILE = STATE_DIR / "sicherheit.jsonl"
 
 VORGABEN = {
     "PVE_HOST": "", "PVE_URL": "", "ADRESSE": "0.0.0.0", "PORT": "8080", "TOKEN": "", "PROXY_IP": "",
-    "SNAPSHOTS_BEHALTEN": "2", "NEUSTART_NACH_UPDATE": "nein", "HOST_AUTO_UPDATE": "nein",
+    "SNAPSHOTS_BEHALTEN": "2", "SNAPSHOTS_NACH_ERFOLG_LOESCHEN": "ja", "NEUSTART_NACH_UPDATE": "nein", "HOST_AUTO_UPDATE": "nein",
     "MELDUNG_URL": "", "MELDUNG_TOKEN": "", "HEARTBEAT_URL": "", "HEALTH_DETAILS": "nein",
     "MELDUNG_ANMELDUNG": "ja", "TOKEN_IN_URL": "nein",
 }
@@ -177,6 +177,8 @@ def helfer(*args, timeout=60):
 
 def update_optionen(konf):
     opts = [f"--snapshots={zahl(konf['SNAPSHOTS_BEHALTEN'], 2)}"]
+    if ja(konf["SNAPSHOTS_NACH_ERFOLG_LOESCHEN"]):
+        opts.append("--snapshots-loeschen")
     if ja(konf["NEUSTART_NACH_UPDATE"]):
         opts.append("--neustart")
     return opts
@@ -297,6 +299,7 @@ def baue_status(ueb, ueb_fehler, proben, proben_zeit):
         "nacht": {**lies_json(NACHT_FILE, {}), "naechster": naechster_nachtlauf(),
                   "host_auto": ja(konf["HOST_AUTO_UPDATE"])},
         "einstellungen": {"snapshots": zahl(konf["SNAPSHOTS_BEHALTEN"], 2),
+                          "snapshots_loeschen": ja(konf["SNAPSHOTS_NACH_ERFOLG_LOESCHEN"]),
                           "neustart": ja(konf["NEUSTART_NACH_UPDATE"])},
     }
 

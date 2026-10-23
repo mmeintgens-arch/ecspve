@@ -164,12 +164,15 @@ Der Nachtlauf (`ecspve-nacht.timer`, 04:30 plus bis zu 15 Minuten – nach den S
 1. Paketlisten in allen laufenden Containern auffrischen – damit „Updates verfügbar“ stimmt, auch ohne Häkchen.
 2. Proxmox-Host aktualisieren – nur mit `HOST_AUTO_UPDATE=ja` (Standard: nein).
 3. Jeden ausgewählten Container nacheinander:
-   - **Snapshot** `ecspve_<Datum>` (die letzten 2 bleiben, `SNAPSHOTS_BEHALTEN`). Kann der Speicher keine Snapshots,
-     läuft das Update trotzdem und der Auftrag zeigt eine Warnung.
+   - **Snapshot** `ecspve_<Datum>`. Kann der Speicher keine Snapshots, läuft das Update trotzdem und der Auftrag zeigt
+     eine Warnung.
    - **System**: `apt-get update && apt-get full-upgrade` (angepasste Konfigurationsdateien bleiben), `autoremove`.
    - **App**: der eingebaute Update-Weg der App – inklusive deren eigener Sicherung vor dem Update.
    - Danach prüfen: laufen alle Dienste, antwortet die App? Wenn nicht, steht der Auftrag auf „Warnung“, die Karte
      wird rot, und es gibt eine Benachrichtigung.
+   - **Snapshots aufräumen:** Ist alles in Ordnung, löscht ecspve seine Snapshots (`ecspve_…`) des Containers wieder
+     (`SNAPSHOTS_NACH_ERFOLG_LOESCHEN=ja`). Schlägt das Update fehl oder ist danach etwas gestört, bleibt der Snapshot
+     für ein Rollback – höchstens die letzten 2 (`SNAPSHOTS_BEHALTEN`). Eigene Snapshots fasst ecspve nie an.
    - Verlangt ein Update einen Neustart (`/run/reboot-required`), zeigt die Karte „Neustart empfohlen“; mit
      `NEUSTART_NACH_UPDATE=ja` startet der Container gleich neu.
 4. Die Übersicht selbst kommt zuletzt dran.
@@ -245,6 +248,7 @@ Ordnung“ und das Ergebnis jedes Nachtlaufs.
 | `MELDUNG_ANMELDUNG` | `ja` | bei jeder erfolgreichen Anmeldung eine Nachricht an `MELDUNG_URL` (Sperren und neue Authenticator-Apps immer) |
 | `TOKEN` | zufällig | für `/api/status` und `/metrics` |
 | `SNAPSHOTS_BEHALTEN` | `2` | Snapshot vor jedem Update, so viele bleiben (0 = keiner) |
+| `SNAPSHOTS_NACH_ERFOLG_LOESCHEN` | `ja` | nach einem erfolgreichen Update die Snapshots von ecspve wieder löschen |
 | `NEUSTART_NACH_UPDATE` | `nein` | Container neu starten, wenn ein Update es verlangt |
 | `HOST_AUTO_UPDATE` | `nein` | Proxmox-Host im Nachtlauf mit aktualisieren |
 | `MELDUNG_URL`, `MELDUNG_TOKEN` | – | ntfy-Thema für Benachrichtigungen |
@@ -334,7 +338,7 @@ Jede Person bekommt einen eigenen Zugang – mit eigenem Passwort, eigenem zweit
   **Sicherheit → Neue Notfallcodes**. Ist alles weg: ein Admin setzt den zweiten Faktor zurück (oder im Container
   `ecspve zwei-faktor zuruecksetzen NAME`).
 - **Neues Handy einrichten** (nach Verlust) meldet alle anderen Handys und Sitzungen dieses Benutzers ab. Ein neues
-  Passwort (**Sicherheit → Passwort ändern**) ebenso.
+  Passwort (**Sicherheit → Passwort ändern** oder oben rechts im Konto-Menü) ebenso.
 - Passwort-Hashes und App-Geheimnisse liegen nur im Container (`/var/lib/ecspve/benutzer.json`, nur für den Dienst
   lesbar).
 - Bis zur ersten Anmeldung ist der zweite Faktor noch nicht eingerichtet – wer bis dahin das Passwort kennt, könnte
