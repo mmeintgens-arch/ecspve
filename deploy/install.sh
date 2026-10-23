@@ -56,6 +56,8 @@ rm -rf /opt/ecspve.alt
 mv /opt/ecspve.neu /opt/ecspve
 rm -rf /opt/ecspve.alt
 install -m 0755 "$SRC/deploy/ecspve" /usr/local/bin/ecspve
+# Auch für „pct enter“ und „pct exec“: deren Suchpfad kennt /usr/local/bin nicht, wohl aber /usr/sbin
+ln -sfn /usr/local/bin/ecspve /usr/sbin/ecspve
 
 # --- Einstellungen -------------------------------------------------------------------------------------------
 say "Einstellungen ($ENV_FILE)"
