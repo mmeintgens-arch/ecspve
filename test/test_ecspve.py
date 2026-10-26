@@ -100,6 +100,15 @@ class Pruefskript(unittest.TestCase):
         self.assertIsNone(helfer.app_update_befehle(105, ["streetworkdoc"], konf))
         self.assertEqual(helfer.app_update_befehle(130, [], {"UPDATE_130": "mein-update {id}"}),
                          [["bash", "-c", "mein-update 130"]])
+        # Skripte mit Rückfrage bekommen beim Update --yes (auch im Container), ältere ohne die Option nicht
+        self.assertEqual(helfer.app_update_befehle(101, ["ecswebsite"], konf, bestaetigt=True),
+                         [[f"{ORDNER}/opt/ecswebsite/pve-install.sh", "--pull", "--update", "--ctid=101", "--yes"]])
+        self.assertEqual(helfer.app_update_befehle(102, ["turnierapp"], konf, bestaetigt=True),
+                         [["pct", "exec", "102", "--", "env", f"PATH={helfer.PFAD}", "turnierapp-update", "--yes"]])
+        self.assertEqual(helfer.app_update_befehle(110, ["ecspve"], konf, bestaetigt=True),
+                         [[f"{ORDNER}/opt/ecspve/pve-install.sh", "--pull", "--update", "--ctid=110"]])
+        self.assertEqual(helfer.app_update_befehle(130, [], {"UPDATE_130": "mein-update {id}"}, bestaetigt=True),
+                         [["bash", "-c", "mein-update 130"]])
 
 
 class HelferBefehle(unittest.TestCase):
@@ -144,6 +153,19 @@ class HelferBefehle(unittest.TestCase):
         self.assertEqual(len(snaps), 1, snaps)  # der ältere ist wieder weg
         rc, mit_log = helfer_aufruf("auftrag", job["id"])
         self.assertIn("turnierapp-update", mit_log["protokoll"])
+
+    def test_app_update_mit_rueckfrage(self):
+        # Ohne Terminal bricht das Skript ohne --yes ab – über die Übersicht muss das Update trotzdem durchgehen
+        p = subprocess.run([str(ORDNER / "opt/ecswebsite/pve-install.sh"), "--pull"], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("Keine Rückfrage möglich", p.stderr)
+        rc, job = helfer_aufruf("update", "101", "app")
+        fertig = warte_auf_auftrag(job["id"])
+        self.assertEqual(fertig["status"], "ok", fertig)
+        rc, mit_log = helfer_aufruf("auftrag", job["id"])
+        self.assertIn("--ctid=101 --yes", mit_log["protokoll"])
+        self.assertIn("wird ohne Rückfrage übernommen", mit_log["protokoll"])
 
     def test_snapshots_nach_erfolg_loeschen(self):
         conf = ORDNER / "pve/nodes/pve/lxc/103.conf"

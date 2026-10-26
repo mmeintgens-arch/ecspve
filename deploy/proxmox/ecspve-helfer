@@ -80,7 +80,8 @@ def im_ct(gid, *befehl):
 
 # Die eigenen Apps: erkannt an ihrer systemd-Einheit im Container. "pruefung" ist eine Adresse im Container,
 # "pruefbefehl" ein Befehl im Container. "update" läuft auf dem Host – so, wie es die jeweilige Doku beschreibt.
-# {id} = Container-ID, {STREETWORKDOC_QUELLE} = Projektordner aus helfer.conf.
+# {id} = Container-ID, {STREETWORKDOC_QUELLE} = Projektordner aus helfer.conf. Fragt das Skript vor dem Übernehmen
+# eines neuen Stands nach, bekommt es BESTAETIGUNG angehängt (siehe kennt_bestaetigung).
 APPS = [
     {"key": "ecswebsite", "name": "Website", "merkmal": "ecswebsite-web.service",
      "pruefung": "http://127.0.0.1:8000/healthz",
@@ -105,6 +106,7 @@ APPS = [
      "update": ["/opt/ecspve/pve-install.sh", "--pull", "--update", "--ctid={id}"]},
 ]
 APPS_NACH_KEY = {a["key"]: a for a in APPS}
+BESTAETIGUNG = "--yes"
 
 # Läuft im Container (sh). Gibt Zeilen „schlüssel=wert“ aus; „u:“-Zeilen kommen von systemctl show.
 PROBE = r"""
@@ -468,8 +470,28 @@ def pruefen_alle():
     return {str(gid): erg for gid, erg in zip(ids, ergebnisse)}
 
 
-def app_update_befehle(gid, apps, konf):
-    """Befehle (auf dem Host) für das App-Update eines Containers – None, wenn keins eingerichtet ist."""
+def kennt_bestaetigung(befehl):
+    """Die Update-Skripte der Apps zeigen vor dem Übernehmen eines neuen Stands die Änderungen und fragen nach – ohne
+    Terminal brechen sie ab. Mit --yes übernehmen sie ohne Rückfrage. Ältere Fassungen ohne Rückfrage kennen die
+    Option nicht und brechen bei ihr ab – deshalb nachsehen, ob das Skript sie auswertet („--yes)“ im case)."""
+    muster = BESTAETIGUNG + ")"
+    if befehl[0] == "pct":  # Skript im Container: das letzte Wort ist sein Pfad oder Befehlsname
+        try:
+            p = subprocess.run(im_ct(befehl[2], "sh", "-c", 'case $1 in /*) f=$1 ;; *) f=$(command -v "$1") ;; esac '
+                                     '&& grep -qsF -e "$2" "$f"', "sh", befehl[-1], muster),
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except subprocess.TimeoutExpired:
+            return False
+        return p.returncode == 0
+    try:
+        return muster in Path(befehl[0]).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def app_update_befehle(gid, apps, konf, bestaetigt=False):
+    """Befehle (auf dem Host) für das App-Update eines Containers – None, wenn keins eingerichtet ist. bestaetigt:
+    Wer hier „Aktualisieren“ klickt oder „Nachts automatisch: App“ setzt, hat das Update schon bestätigt."""
     eigen = konf.get(f"UPDATE_{gid}", "").strip()
     if eigen:
         return [["bash", "-c", eigen.replace("{id}", str(gid))]]
@@ -489,6 +511,8 @@ def app_update_befehle(gid, apps, konf):
             if not app.get("ersatz"):
                 continue
             befehl = [ersetze(t) for t in app["ersatz"]]
+        if bestaetigt and kennt_bestaetigung(befehl):
+            befehl.append(BESTAETIGUNG)
         schritte = [["git", "-C", ersetze(app["git"]), "pull", "--ff-only"]] if app.get("git") else []
         return schritte + [befehl]
     return None
@@ -719,13 +743,16 @@ def a_update(job, log):
         if log.befehl(im_ct(gid, "env", *APT_ENV, "sh", "-c", APT_UPGRADE)):
             raise Fehler("Update des Betriebssystems fehlgeschlagen – Details im Protokoll.")
     if was in ("alles", "app"):
-        befehle = app_update_befehle(gid, vorher["apps"], konf)
+        befehle = app_update_befehle(gid, vorher["apps"], konf, bestaetigt=True)
         if befehle is None:
             if was == "app":
                 raise Fehler("Für diesen Container ist kein App-Update eingerichtet.")
             log.zeile("Kein App-Update eingerichtet – übersprungen.")
         else:
             log.abschnitt(f"App aktualisieren ({vorher['app_name'] or 'eigener Befehl'})")
+            if befehle[-1][-1] == BESTAETIGUNG:
+                log.zeile(f"Das Update-Skript fragt vor dem Übernehmen eines neuen Stands nach – der Auftrag aus der "
+                          f"Übersicht gilt als Bestätigung ({BESTAETIGUNG}). Die neuen Commits stehen unten.")
             for befehl in befehle:
                 if log.befehl(befehl, umgebung={"HOME": "/root"}):
                     raise Fehler("App-Update fehlgeschlagen – Details im Protokoll.")

@@ -71,6 +71,14 @@ Erkannt wird eine App an ihrer systemd-Einheit im Container – egal, welche ID 
 | StreetworkDoc | `streetworkdoc.service` | `https://127.0.0.1:8443/api/v1/info` | `git pull` + `deploy/proxmox/create-lxc.sh --update <ID>` im Projektordner (`STREETWORKDOC_QUELLE`) |
 | Übersicht (diese App) | `ecspve.service` | `ecspve ping` | `/opt/ecspve/pve-install.sh --pull --update --ctid=<ID>` |
 
+**Rückfrage vor dem Update:** Die Update-Skripte von Website, Wiki, Turniersystem, Recherchetool und StreetworkDoc
+zeigen vor dem Übernehmen eines neuen Stands die neuen Commits und fragen nach – ohne Terminal brechen sie ab. Aus der
+Übersicht gilt der Klick auf **Aktualisieren** (bzw. das Häkchen **Nachts automatisch: App**) als Bestätigung: Der
+Helfer hängt `--yes` an, aber nur, wenn das installierte Skript die Option kennt (ältere Fassungen ohne Rückfrage
+brechen bei einer unbekannten Option ab). Welche Commits kamen, steht im Protokoll des Auftrags. Wer jeden neuen Stand
+vorher selbst ansehen will, lässt das Häkchen **App** weg und aktualisiert die App im Terminal. Website und Wiki
+übernehmen mit Freigabeschlüssel (`allowed_signers`) auch mit `--yes` nur signierte Freigaben.
+
 Die Übersicht ist nicht auf diese Apps beschränkt: **jeder** Container und jede VM auf dem Host erscheint von selbst,
 auch neue – nach etwa 10 Sekunden. Andere Container (z. B. euer Caddy) zeigt sie genauso, mit Diensten, Updates und
 Betriebssystem-Update, nur ohne App-Prüfung und App-Update. Eine eigene Funktionsprüfung legt ihr direkt in der Karte
@@ -167,7 +175,8 @@ Der Nachtlauf (`ecspve-nacht.timer`, 04:30 plus bis zu 15 Minuten – nach den S
    - **Snapshot** `ecspve_<Datum>`. Kann der Speicher keine Snapshots, läuft das Update trotzdem und der Auftrag zeigt
      eine Warnung.
    - **System**: `apt-get update && apt-get full-upgrade` (angepasste Konfigurationsdateien bleiben), `autoremove`.
-   - **App**: der eingebaute Update-Weg der App – inklusive deren eigener Sicherung vor dem Update.
+   - **App**: der eingebaute Update-Weg der App – inklusive deren eigener Sicherung vor dem Update. Ihre Rückfrage
+     beantwortet der Helfer mit `--yes` (siehe [Die Apps](#die-apps-die-die-übersicht-kennt)).
    - Danach prüfen: laufen alle Dienste, antwortet die App? Wenn nicht, steht der Auftrag auf „Warnung“, die Karte
      wird rot, und es gibt eine Benachrichtigung.
    - **Snapshots aufräumen:** Ist alles in Ordnung, löscht ecspve seine Snapshots (`ecspve_…`) des Containers wieder

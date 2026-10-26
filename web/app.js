@@ -716,7 +716,9 @@
     const e = stand.einstellungen || {};
     const snap = !e.snapshots ? "" : "\n\nVorher wird ein Snapshot angelegt (falls der Speicher das kann)"
       + (e.snapshots_loeschen ? " – nach erfolgreichem Update wird er wieder gelöscht." : ".");
-    if (!confirm(`„${g.name}“ aktualisieren (${WAS[was]})?${snap}`)) return;
+    const app = was !== "system" && g.probe && g.probe.app_update
+      ? "\n\nEin neuer Stand der App wird ohne weitere Rückfrage übernommen – welche Änderungen kamen, steht danach im Protokoll." : "";
+    if (!confirm(`„${g.name}“ aktualisieren (${WAS[was]})?${snap}${app}`)) return;
     auftrag("/api/aktion", { id: g.id, aktion: "update", was }, `${g.name}: Update eingeplant`);
   }
   function dienstNeustart(g, dienst) {
@@ -733,7 +735,7 @@
   async function alleAktualisieren() {
     const zahl = stand.gaeste.filter((g) => g.typ === "lxc" && g.lokal && g.status === "running" && !g.auftrag).length;
     if (!zahl) { toast("Kein laufender Container frei."); return; }
-    if (!confirm(`Alle ${zahl} laufenden Container nacheinander aktualisieren (System und App)?`)) return;
+    if (!confirm(`Alle ${zahl} laufenden Container nacheinander aktualisieren (System und App)?\n\nNeue Stände der Apps werden ohne weitere Rückfrage übernommen – welche Änderungen kamen, steht danach im Protokoll.`)) return;
     const erg = await auftrag("/api/alle", {}, "Updates eingeplant");
     if (erg && erg.fehler && erg.fehler.length) toast(`Nicht möglich: ${erg.fehler.join("; ")}`);
   }

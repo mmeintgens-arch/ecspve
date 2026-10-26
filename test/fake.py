@@ -233,7 +233,7 @@ def pct(name, args, ordner):
             while befehl_ct and "=" in befehl_ct[0]:
                 befehl_ct = befehl_ct[1:]
         if befehl_ct[:2] == ["sh", "-c"]:
-            return pruefskript(int(gid), g, befehl_ct[2], ordner)
+            return pruefskript(int(gid), g, befehl_ct[2], ordner, befehl_ct[3:])
         if befehl_ct == ["chpasswd"]:
             sys.stdin.read()
             return 0
@@ -264,7 +264,7 @@ def pct_create(gid, args, ordner):
     return 0
 
 
-def pruefskript(gid, g, skript, ordner):
+def pruefskript(gid, g, skript, ordner, argumente=()):
     """Führt das echte Prüfskript aus – mit Dateien und Befehlen des nachgebauten Containers."""
     wurzel = ordner / "ct" / str(gid)
     skript = (skript.replace("/etc/systemd/system", str(wurzel / "systemd"))
@@ -273,7 +273,7 @@ def pruefskript(gid, g, skript, ordner):
               .replace("/run/ecspve-updates", str(wurzel / "updates-zwischenspeicher"))
               .replace("/usr/local/bin/ecspve", str(ordner / "ctbin" / "ecspve")))
     umgebung = {**os.environ, "FAKE_CT": str(gid), "PATH": f"{ordner / 'ctbin'}:{os.environ['PATH']}"}
-    return os.spawnvpe(os.P_WAIT, "sh", ["sh", "-c", skript], umgebung)
+    return os.spawnvpe(os.P_WAIT, "sh", ["sh", "-c", skript, *argumente], umgebung)
 
 
 def im_container(name, args, g):
@@ -309,6 +309,23 @@ def im_container(name, args, g):
 
 # --- Aufbau ----------------------------------------------------------------------------------------------
 
+# Wie pve-install.sh von Website und Wiki: zeigt die neuen Commits und fragt nach – ohne Terminal nur mit --yes
+RUECKFRAGE = r"""#!/bin/sh
+ja=0
+for a in "$@"; do case "$a" in --yes) ja=1 ;; esac; done
+echo "(Attrappe) $0 $*"
+echo "Neue Commits (1):"
+echo "  abc1234 Neue Funktion"
+if [ "$ja" = 1 ]; then
+  echo "--yes: wird ohne Rückfrage übernommen."
+elif [ ! -t 0 ]; then
+  echo "Fehler: Keine Rückfrage möglich (kein Terminal). Änderungen ansehen und mit --pull --yes bestätigen." >&2
+  exit 1
+fi
+echo "==> Fertig"
+"""
+
+
 def anlegen(ordner):
     ordner = Path(ordner).resolve()
     if ordner.exists():
@@ -339,9 +356,15 @@ def anlegen(ordner):
             (ordner / "ct" / str(gid) / "reboot-required").write_text("*** System restart required ***\n")
     (ordner / "boot" / "vmlinuz-6.8.12-9-pve").write_text("")
     # Werkzeuge der Apps auf dem „Host“ (für die App-Updates)
-    for pfad in ("opt/ecswebsite/pve-install.sh", "opt/ecswiki/pve-install.sh", "opt/ecspve/pve-install.sh"):
-        (ordner / pfad).parent.mkdir(parents=True, exist_ok=True)
-        (ordner / pfad).symlink_to(starter)
+    for pfad in ("opt/ecswebsite/pve-install.sh", "opt/ecswiki/pve-install.sh"):
+        (ordner / pfad).parent.mkdir(parents=True)
+        (ordner / pfad).write_text(RUECKFRAGE)
+        (ordner / pfad).chmod(0o755)
+    (ordner / "opt/ecspve").mkdir()
+    (ordner / "opt/ecspve/pve-install.sh").symlink_to(starter)  # fragt nicht nach, kennt kein --yes
+    # turnierapp-update im Container: wird nur nach --yes durchsucht, nicht ausgeführt
+    (ordner / "ctbin" / "turnierapp-update").write_text("#!/bin/sh\ncase $1 in -y | --yes) ;; esac\n")
+    (ordner / "ctbin" / "turnierapp-update").chmod(0o755)
     (ordner / "helfer.conf").write_text("# Attrappe\nHOST_UPDATE=ja\n")
     (ordner / "conf" / "ecspve.env").write_text("PVE_HOST=192.168.10.5\nPORT=8080\nTOKEN=test-token-123\n")
     return ordner
