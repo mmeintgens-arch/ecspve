@@ -90,6 +90,29 @@ class Pruefskript(unittest.TestCase):
         caddy = {d["name"]: d["zustand"] for d in erg["120"]["dienste"]}
         self.assertEqual((caddy["tmp.mount"], caddy["run-lock.mount"], caddy["caddy.service"]), ("ruhe", "ruhe", "ok"))
 
+    def test_bestaetigung_hinter_startskript(self):
+        # deploy-key.sh des Turniersystems legt turnierapp-update-lxc als kleines Startskript an – --yes steht erst im
+        # Ziel. Ohne Blick dorthin bekam das nächtliche Update kein --yes und brach ohne Terminal ab.
+        start = ORDNER / "usr/local/sbin/turnierapp-update-lxc"
+        ziel = ORDNER / "root/Tunierapp/deploy/proxmox/update-lxc.sh"
+        start.parent.mkdir(parents=True, exist_ok=True)
+        ziel.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(start.unlink, missing_ok=True)
+        self.addCleanup(ziel.unlink, missing_ok=True)
+        start.write_text("#!/usr/bin/env bash\n# Eingerichtet von deploy-key.sh\n"
+                         "exec bash /root/Tunierapp/deploy/proxmox/update-lxc.sh \"$@\"\n")
+        ziel.write_text('#!/usr/bin/env bash\ncase "$1" in -y | --yes) yes=1 ;; esac\n')
+        self.assertEqual(helfer.app_update_befehle(101, ["turnierapp"], {}, bestaetigt=True),
+                         [[str(start), "101", "--pull", "--yes"]])
+        # Ältere Fassung ohne --yes: keine Option anhängen (sie bräche bei unbekannten Optionen ab)
+        ziel.write_text('#!/usr/bin/env bash\ncase "$1" in --pull) pull=1 ;; esac\n')
+        self.assertEqual(helfer.app_update_befehle(101, ["turnierapp"], {}, bestaetigt=True),
+                         [[str(start), "101", "--pull"]])
+        # Kein Ausweg aus dem Wurzelordner
+        start.write_text("#!/bin/sh\nexec bash /root/../etc/passwd \"$@\"\n")
+        self.assertEqual(helfer.app_update_befehle(101, ["turnierapp"], {}, bestaetigt=True),
+                         [[str(start), "101", "--pull"]])
+
     def test_app_update_befehle(self):
         konf = {"STREETWORKDOC_QUELLE": "/gibt/es/nicht"}
         self.assertEqual(helfer.app_update_befehle(101, ["ecswebsite"], konf),
@@ -690,3 +713,72 @@ class Weboberflaeche(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Nachtlauf(unittest.TestCase):
+    """Ein gescheitertes Update im Nachtlauf: steht im Journal und als eigenes Problem in der Übersicht – der Dienst
+    ecspve-nacht selbst gilt dafür nicht als ausgefallen."""
+
+    def setUp(self):
+        from unittest import mock
+
+        self.addCleanup(lambda: ecspve.NACHT_FILE.unlink(missing_ok=True))
+        gaeste = [{"id": 101, "name": "ecswebsite", "typ": "lxc", "lokal": True, "status": "running",
+                   "vorlage": False, "tags": []},
+                  {"id": 102, "name": "ecswiki", "typ": "lxc", "lokal": True, "status": "running",
+                   "vorlage": False, "tags": []}]
+
+        def fake_helfer(befehl, *args, **kw):
+            if befehl == "uebersicht":
+                return {"gaeste": gaeste, "knoten": "pve"}
+            return {"id": f"job-{befehl}-{args[0] if args else ''}"}
+
+        def fake_warte(jid, hoechstens=0):
+            if jid == "job-update-101":
+                return {"id": jid, "status": "fehler", "ergebnis": "Update-Skript endete mit Fehler 1"}
+            return {"id": jid, "status": "ok", "ergebnis": "aktualisiert"}
+
+        for name, wert in (("helfer", fake_helfer), ("warte_auf", fake_warte), ("melden", lambda *a, **k: None),
+                           ("lade_einstellungen", lambda: {"101": {"app": True}, "102": {"system": True}})):
+            patcher = mock.patch.object(ecspve, name, side_effect=wert)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_failed_update_is_logged_and_shown_but_service_succeeds(self):
+        import contextlib
+        import io
+
+        fehler = io.StringIO()
+        with contextlib.redirect_stderr(fehler):
+            self.assertEqual(ecspve.nacht(), 0)
+        self.assertIn("✘ ecswebsite (101): Update-Skript endete mit Fehler 1 (Auftrag job-update-101)", fehler.getvalue())
+        self.assertIn("✔ ecswiki (102): aktualisiert", fehler.getvalue())
+        bericht = ecspve.lies_json(ecspve.NACHT_FILE, {})
+        self.assertEqual(bericht["fehler"], 1)
+        st = ecspve.baue_status({}, "", {}, 0)
+        nacht = [p for p in st["probleme"] if p["schluessel"] == "nacht"]
+        self.assertEqual(len(nacht), 1)
+        self.assertIn("1 Update fehlgeschlagen (ecswebsite (101))", nacht[0]["text"])
+        self.assertTrue(nacht[0]["still"])  # schon vom Nachtlauf gemeldet
+
+    def test_no_connection_still_fails(self):
+        def kaputt(*a, **k):
+            raise ecspve.HelferFehler("Verbindung abgelehnt")
+
+        ecspve.helfer.side_effect = kaputt
+        with contextlib_quiet():
+            self.assertEqual(ecspve.nacht(), 1)
+
+    def test_clean_night_shows_no_problem(self):
+        ecspve.warte_auf.side_effect = lambda jid, hoechstens=0: {"id": jid, "status": "ok", "ergebnis": "aktualisiert"}
+        with contextlib_quiet():
+            self.assertEqual(ecspve.nacht(), 0)
+        st = ecspve.baue_status({}, "", {}, 0)
+        self.assertFalse([p for p in st["probleme"] if p["schluessel"] == "nacht"])
+
+
+def contextlib_quiet():
+    import contextlib
+    import io
+
+    return contextlib.redirect_stderr(io.StringIO())

@@ -288,6 +288,15 @@ def baue_status(ueb, ueb_fehler, proben, proben_zeit):
         for schluessel, text in fehler:
             probleme.append({"schluessel": f"{gid}:{schluessel}", "text": f"{g['name']} ({gid}): {text}", "gast": gid})
         gaeste.append(g)
+    nacht_bericht = lies_json(NACHT_FILE, {})
+    if nacht_bericht.get("ende") and nacht_bericht.get("fehler"):
+        # Gescheiterte Updates des letzten Nachtlaufs – bis zum nächsten Lauf ohne Fehler. Gemeldet hat sie der
+        # Nachtlauf selbst schon („still“), der Dienst selbst gilt dafür nicht mehr als ausgefallen.
+        namen = [e["titel"] for e in nacht_bericht.get("ergebnisse", []) if e.get("status") == "fehler"]
+        wann = time.strftime("%d.%m. %H:%M", time.localtime(nacht_bericht["ende"]))
+        probleme.append({"schluessel": "nacht", "still": True,
+                         "text": f"Nachtlauf vom {wann}: {len(namen)} Update{'s' if len(namen) != 1 else ''} "
+                                 f"fehlgeschlagen ({', '.join(namen)}) – Einzelheiten unter „Nachtlauf“"})
     updates_gaeste = sum((g["probe"] or {}).get("updates") or 0 for g in gaeste)
     if updates_gaeste:
         hinweise.append(f"Container: {updates_gaeste} Updates verfügbar")
@@ -380,7 +389,8 @@ class Sammler:
             self.pruef_wecker.set()  # ein Auftrag ist fertig: Container gleich neu prüfen
         self.laufende = laufende
 
-        aktuell = {p["schluessel"]: p["text"] for p in st["probleme"]}
+        # „still“: schon anderswo gemeldet (Nachtlauf) – nicht noch einmal als Störung verschicken
+        aktuell = {p["schluessel"]: p["text"] for p in st["probleme"] if not p.get("still")}
         self.zaehler = {k: self.zaehler.get(k, 0) + 1 for k in aktuell}
         # Erst melden, wenn ein Problem drei Abfragen hintereinander besteht – kurze Aussetzer nicht
         neu = {k: aktuell[k] for k, n in self.zaehler.items() if n >= 3 and k not in self.gemeldet}
@@ -1511,6 +1521,10 @@ def nacht():
     def eintragen(titel, job):
         bericht["ergebnisse"].append({"titel": titel, "status": job.get("status"), "ergebnis": job.get("ergebnis", ""),
                                       "auftrag": job.get("id")})
+        # Ins Journal (journalctl -u ecspve-nacht): was gescheitert ist, steht sonst nur in der Oberfläche
+        zeichen = {"ok": "✔", "warnung": "⚠", "fehler": "✘"}.get(job.get("status"), "?")
+        log(f"{zeichen} {titel}: {job.get('ergebnis', '') or job.get('status')}"
+            + (f" (Auftrag {job['id']})" if job.get("id") else ""))
         bericht["fehler"] = sum(e["status"] == "fehler" for e in bericht["ergebnisse"])
         schreibe_json(NACHT_FILE, bericht)
 
@@ -1557,7 +1571,12 @@ def nacht():
         probleme = sum(e["status"] != "ok" for e in bericht["ergebnisse"])
         melden("Nachtlauf: alles aktualisiert" if not probleme else f"Nachtlauf: {probleme} mit Problemen", text,
                bool(probleme))
-    return 1 if bericht["fehler"] else 0
+    # Der Lauf selbst hat geklappt: Gescheiterte Updates stehen im Bericht, in der Übersicht („Nachtlauf vom …“)
+    # und in der Meldung – der Dienst gilt dafür nicht als ausgefallen (sonst „Dienst ecspve-nacht ist ausgefallen“
+    # bis zum nächsten Lauf, ohne zu sagen, was los ist)
+    if bericht["fehler"]:
+        log(f"Nachtlauf beendet – {bericht['fehler']} Update(s) fehlgeschlagen, Einzelheiten oben und in der Übersicht")
+    return 0
 
 
 # --- Kommandozeile ---------------------------------------------------------------------------------------
