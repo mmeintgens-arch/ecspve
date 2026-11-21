@@ -90,6 +90,29 @@ class Pruefskript(unittest.TestCase):
         caddy = {d["name"]: d["zustand"] for d in erg["120"]["dienste"]}
         self.assertEqual((caddy["tmp.mount"], caddy["run-lock.mount"], caddy["caddy.service"]), ("ruhe", "ruhe", "ok"))
 
+    def test_bestaetigung_hinter_startskript(self):
+        # deploy-key.sh des Turniersystems legt turnierapp-update-lxc als kleines Startskript an – --yes steht erst im
+        # Ziel. Ohne Blick dorthin bekam das nächtliche Update kein --yes und brach ohne Terminal ab.
+        start = ORDNER / "usr/local/sbin/turnierapp-update-lxc"
+        ziel = ORDNER / "root/Tunierapp/deploy/proxmox/update-lxc.sh"
+        start.parent.mkdir(parents=True, exist_ok=True)
+        ziel.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(start.unlink, missing_ok=True)
+        self.addCleanup(ziel.unlink, missing_ok=True)
+        start.write_text("#!/usr/bin/env bash\n# Eingerichtet von deploy-key.sh\n"
+                         "exec bash /root/Tunierapp/deploy/proxmox/update-lxc.sh \"$@\"\n")
+        ziel.write_text('#!/usr/bin/env bash\ncase "$1" in -y | --yes) yes=1 ;; esac\n')
+        self.assertEqual(helfer.app_update_befehle(101, ["turnierapp"], {}, bestaetigt=True),
+                         [[str(start), "101", "--pull", "--yes"]])
+        # Ältere Fassung ohne --yes: keine Option anhängen (sie bräche bei unbekannten Optionen ab)
+        ziel.write_text('#!/usr/bin/env bash\ncase "$1" in --pull) pull=1 ;; esac\n')
+        self.assertEqual(helfer.app_update_befehle(101, ["turnierapp"], {}, bestaetigt=True),
+                         [[str(start), "101", "--pull"]])
+        # Kein Ausweg aus dem Wurzelordner
+        start.write_text("#!/bin/sh\nexec bash /root/../etc/passwd \"$@\"\n")
+        self.assertEqual(helfer.app_update_befehle(101, ["turnierapp"], {}, bestaetigt=True),
+                         [[str(start), "101", "--pull"]])
+
     def test_app_update_befehle(self):
         konf = {"STREETWORKDOC_QUELLE": "/gibt/es/nicht"}
         self.assertEqual(helfer.app_update_befehle(101, ["ecswebsite"], konf),

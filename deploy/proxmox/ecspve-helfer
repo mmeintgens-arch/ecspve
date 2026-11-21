@@ -483,10 +483,36 @@ def kennt_bestaetigung(befehl):
         except subprocess.TimeoutExpired:
             return False
         return p.returncode == 0
+    return _skript_kennt(Path(befehl[0]), muster)
+
+
+def _skript_kennt(pfad, muster, tiefe=0):
+    """Wertet das Skript die Option aus? Kleine Startskripte („exec bash /root/Tunierapp/deploy/proxmox/update-lxc.sh
+    "$@"“, so legt deploy-key.sh turnierapp-update-lxc an) enthalten sie selbst nicht – dann im Ziel nachsehen."""
     try:
-        return muster in Path(befehl[0]).read_text(encoding="utf-8", errors="replace")
+        text = pfad.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
+    if muster in text:
+        return True
+    if tiefe >= 2 or len(text) > 4096:
+        return False
+    for zeile in text.splitlines():
+        try:
+            teile = shlex.split(zeile, comments=True)
+        except ValueError:
+            continue
+        if not teile or teile[0] != "exec":
+            continue
+        teile = teile[1:]
+        if teile and Path(teile[0]).name in ("bash", "sh"):
+            teile = teile[1:]
+        if teile and teile[0].startswith("/"):
+            ziel = Path(teile[0])
+            if not ziel.is_absolute() or ".." in ziel.parts:
+                return False
+            return _skript_kennt(Path(WURZEL + str(ziel)) if WURZEL else ziel, muster, tiefe + 1)
+    return False
 
 
 def app_update_befehle(gid, apps, konf, bestaetigt=False):
