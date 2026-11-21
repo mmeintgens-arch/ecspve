@@ -186,6 +186,11 @@ Der Nachtlauf (`ecspve-nacht.timer`, 04:30 plus bis zu 15 Minuten – nach den S
      `NEUSTART_NACH_UPDATE=ja` startet der Container gleich neu.
 4. Die Übersicht selbst kommt zuletzt dran.
 
+Das Ergebnis steht in der Karte „Nachtlauf“, im Journal (`journalctl -u ecspve-nacht`, eine Zeile je Update, z. B.
+`✘ ecswebsite (101): …`) und in der Benachrichtigung. Ist ein Update gescheitert, zeigt die Übersicht bis zum nächsten
+Lauf ohne Fehler das Problem „Nachtlauf vom …: 1 Update fehlgeschlagen (…)“. Der Dienst `ecspve-nacht` selbst gilt
+nur dann als ausgefallen, wenn der Lauf gar nicht möglich war (z. B. keine Verbindung zum Proxmox-Host).
+
 Zurück zu einem Snapshot: in Proxmox beim Container unter **Snapshots** → **Rollback**.
 
 Andere Uhrzeit: im Container `systemctl edit ecspve-nacht.timer` und dort
